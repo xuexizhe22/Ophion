@@ -513,6 +513,24 @@ vmx_init(VOID)
         //
         ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
 
+        //
+        // intercept RDMSR/WRMSR(IA32_FEATURE_CONTROL)
+        // stealth: sanitize VMX/SMX enable bits on read, #GP on write (lock bit set)
+        //
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+
+        //
+        // intercept all VMX capability MSRs (0x480-0x493)
+        // reads: pass through real values (consistent with CPUID showing VMX support)
+        // writes: #GP (architecturally read-only)
+        //
+        for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
+        {
+            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+        }
+
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
 

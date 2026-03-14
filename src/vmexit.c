@@ -139,7 +139,7 @@ vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (leaf == 1 && g_stealth_enabled)
         {
-            cpu_info[2] &= ~(1 << 31);
+            cpu_info[2] &= ~((1 << 31) | (1 << 6));
         }
     }
 
@@ -224,6 +224,33 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             break;
         }
 
+        //
+        // IA32_FEATURE_CONTROL (MSR 0x3A) - hide VMX/SMX enable bits
+        //
+        // an AC reading this sees VMX-outside-SMX=1 -- knows VMX is available
+        // and likely active. clear all VMX/SMX/SENTER/SGX enables to emulate
+        // a system where firmware disabled these features.
+        //
+        case IA32_FEATURE_CONTROL:
+        {
+            IA32_FEATURE_CONTROL_REGISTER feat = {0};
+            feat.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
+
+            if (g_stealth_enabled)
+            {
+                feat.Lock                      = 1;
+                feat.EnableVmxInsideSmx        = 0;
+                feat.EnableVmxOutsideSmx       = 0;
+                feat.SenterLocalFunctionEnables = 0;
+                feat.SenterGlobalEnable        = 0;
+                feat.SgxLaunchControlEnable    = 0;
+                feat.SgxGlobalEnable           = 0;
+            }
+
+            msr.Flags = feat.AsUInt;
+            break;
+        }
+
         default:
             msr.Flags = __readmsr(target_msr);
             break;
@@ -254,6 +281,18 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
     // hypervisor synthetic MSRs — inject #GP
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
+    {
+        vmexit_inject_gp();
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
+    //
+    // IA32_FEATURE_CONTROL: #GP on write (lock bit is always set on a running system)
+    // VMX capability MSRs (0x480-0x493): architecturally read-only, writes always #GP
+    //
+    if (target_msr == IA32_FEATURE_CONTROL ||
+        (target_msr >= IA32_VMX_BASIC && target_msr <= 0x493))
     {
         vmexit_inject_gp();
         vcpu->advance_rip = FALSE;
