@@ -143,6 +143,14 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     //
     BOOLEAN has_pending_nmi;
 
+    // guest DR0-DR3/DR6 saved on vm-exit, restored before vmresume
+    UINT64  guest_dr0;
+    UINT64  guest_dr1;
+    UINT64  guest_dr2;
+    UINT64  guest_dr3;
+    UINT64  guest_dr6;
+    BOOLEAN mov_dr_exiting;
+
 } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
 
 #define VMCALL_TEST             0x00000001

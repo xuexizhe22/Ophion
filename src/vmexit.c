@@ -35,7 +35,6 @@ vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
 
     //
     // check each DR0-DR3: enabled (L or G bit) + execution breakpoint (R/W=00)
-    // DR0-DR3 are shared between host and guest (not in VMCS), so __readdr is correct.
     //
     static const UINT64 ln_bits[] = { DR7_L0, DR7_L1, DR7_L2, DR7_L3 };
     static const UINT64 gn_bits[] = { DR7_G0, DR7_G1, DR7_G2, DR7_G3 };
@@ -54,14 +53,13 @@ vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
         if ((dr7 & DR7_RW_MASK(i)) != 0)
             continue;
 
-        // read DRn and compare to new_rip
         UINT64 drn;
         switch (i)
         {
-        case 0: drn = __readdr(0); break;
-        case 1: drn = __readdr(1); break;
-        case 2: drn = __readdr(2); break;
-        case 3: drn = __readdr(3); break;
+        case 0: drn = vcpu->guest_dr0; break;
+        case 1: drn = vcpu->guest_dr1; break;
+        case 2: drn = vcpu->guest_dr2; break;
+        case 3: drn = vcpu->guest_dr3; break;
         default: continue;
         }
 
@@ -224,13 +222,6 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             break;
         }
 
-        //
-        // IA32_FEATURE_CONTROL (MSR 0x3A) - hide VMX/SMX enable bits
-        //
-        // an AC reading this sees VMX-outside-SMX=1 -- knows VMX is available
-        // and likely active. clear all VMX/SMX/SENTER/SGX enables to emulate
-        // a system where firmware disabled these features.
-        //
         case IA32_FEATURE_CONTROL:
         {
             IA32_FEATURE_CONTROL_REGISTER feat = {0};
@@ -287,10 +278,7 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
         return;
     }
 
-    //
-    // IA32_FEATURE_CONTROL: #GP on write (lock bit is always set on a running system)
-    // VMX capability MSRs (0x480-0x493): architecturally read-only, writes always #GP
-    //
+    // IA32_FEATURE_CONTROL (locked) + VMX capability MSRs (read-only)
     if (target_msr == IA32_FEATURE_CONTROL ||
         (target_msr >= IA32_VMX_BASIC && target_msr <= 0x493))
     {
@@ -727,11 +715,11 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         UINT64 val = *reg_ptr;
         switch (dr_num)
         {
-        case 0: __writedr(0, val); break;
-        case 1: __writedr(1, val); break;
-        case 2: __writedr(2, val); break;
-        case 3: __writedr(3, val); break;
-        case 6: __writedr(6, val); break;
+        case 0: vcpu->guest_dr0 = val; break;
+        case 1: vcpu->guest_dr1 = val; break;
+        case 2: vcpu->guest_dr2 = val; break;
+        case 3: vcpu->guest_dr3 = val; break;
+        case 6: vcpu->guest_dr6 = val; break;
         case 7:
             __vmx_vmwrite(VMCS_GUEST_DR7, val);
             break;
@@ -742,11 +730,11 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         UINT64 val = 0;
         switch (dr_num)
         {
-        case 0: val = __readdr(0); break;
-        case 1: val = __readdr(1); break;
-        case 2: val = __readdr(2); break;
-        case 3: val = __readdr(3); break;
-        case 6: val = __readdr(6); break;
+        case 0: val = vcpu->guest_dr0; break;
+        case 1: val = vcpu->guest_dr1; break;
+        case 2: val = vcpu->guest_dr2; break;
+        case 3: val = vcpu->guest_dr3; break;
+        case 6: val = vcpu->guest_dr6; break;
         case 7:
             __vmx_vmread(VMCS_GUEST_DR7, &val);
             break;
@@ -775,7 +763,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->in_root     = TRUE;
     vcpu->advance_rip = TRUE;
 
-    // __vmx_vmread writes size_t — must use size_t, not UINT32
+    vcpu->guest_dr0 = __readdr(0);
+    vcpu->guest_dr1 = __readdr(1);
+    vcpu->guest_dr2 = __readdr(2);
+    vcpu->guest_dr3 = __readdr(3);
+    vcpu->guest_dr6 = __readdr(6);
+
+    // __vmx_vmread writes size_t
     __vmx_vmread(VMCS_EXIT_REASON, &exit_raw);
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
@@ -1268,6 +1262,16 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     {
         vmexit_advance_rip(vcpu);
     }
+
+    if (!vcpu->vmxoff.executed)
+    {
+        __writedr(0, vcpu->guest_dr0);
+        __writedr(1, vcpu->guest_dr1);
+        __writedr(2, vcpu->guest_dr2);
+        __writedr(3, vcpu->guest_dr3);
+        __writedr(6, vcpu->guest_dr6);
+    }
+
     if (vcpu->vmxoff.executed)
     {
         result = TRUE;
