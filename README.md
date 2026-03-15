@@ -5,6 +5,14 @@ Intel VT-x Type-2 hypervisor that virtualizes an already running Windows system.
 ![Demo](vmaware.png)
 ***
 
+## Blog
+
+> **[Ophion — Building a Stealth Intel VT-x Hypervisor for Windows](https://websec.net/blog/ophion-building-a-stealth-intel-vt-x-hypervisor-for-windows-69b62daa7462693131828c97)**
+>
+> A detailed technical writeup covering the internals of Ophion — VMX bring-up, EPT construction, stealth mechanisms, and the lessons learned along the way. Thanks to [WebSec](https://websec.net) for the motivation and for hosting it.
+
+***
+
 ## Features
 
 - **Per-core VMX** — Virtualizes all logical processors via DPC broadcast. Clean VMXOFF on unload with guest CR3 restoration.
