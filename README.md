@@ -36,7 +36,7 @@ Intel VT-x Type-2 hypervisor that virtualizes an already running Windows system.
 
 | Field | Value |
 |-------|-------|
-| **Pin-based** | External-interrupt exiting, NMI exiting |
+| **Pin-based** | External-interrupt exiting, NMI exiting, virtual NMIs |
 | **Primary proc** | TSC offsetting, MSR bitmaps, I/O bitmaps, activate secondary. CR3/HLT/MOV-DR/RDTSC/INVLPG exiting may be forced by must-be-1 bits. |
 | **Secondary proc** | EPT, VPID, RDTSCP, INVPCID, XSAVES/XRSTORS |
 | **Exit** | 64-bit host, save debug controls, ACK interrupt on exit |
