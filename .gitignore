@@ -361,3 +361,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsdhv.rar
+/images
+/article.md
+/cover.png
+/gen_cover.py
+/gen_diagrams.py
+/src/article.md
