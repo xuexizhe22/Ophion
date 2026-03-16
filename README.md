@@ -1,8 +1,9 @@
 # Ophion
+<div align="center"> <img src="logo.png" alt="Demo" width="800"/> </div>
 
 Intel VT-x Type-2 hypervisor that virtualizes an already running Windows system. Designed for stealth: passes common hypervisor detection checks and works with **EAC/BE/AVs out of the box.** (possibly more, these are the only that have been tested)
 
-![Demo](vmaware.png)
+
 ***
 
 ## Blog
@@ -141,6 +142,7 @@ Passes with all stealth toggles enabled:
 - [VMAware](https://github.com/kernelwernel/VMAware) — DR trap (DR0 + TF on CPUID, DR6 BS+B0), CPUID checks
 - [checkhv_um](https://github.com/zer0condition/checkhv_um) — RDTSC+CPUID+RDTSC timing, CPUID leaf enumeration, brand string
 
+![VMAware](vmaware.png)
 ***
 
 ## Disclaimer
