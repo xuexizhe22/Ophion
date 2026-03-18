@@ -645,19 +645,22 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, guest_phys);
         if (pml1)
         {
+            EPT_PML1_ENTRY new_entry;
+            new_entry.AsUInt = pml1->AsUInt;
+
             if (qual.ReadAccess || qual.WriteAccess)
             {
                 // Guest is trying to read/write the execute-only page.
                 // Swap back to original PFN with Read/Write access (Execute disabled).
-                pml1->ReadAccess      = 1;
-                pml1->WriteAccess     = 1;
-                pml1->ExecuteAccess   = 0;
-                pml1->PageFrameNumber = hook->OriginalPfn;
+                new_entry.ReadAccess      = 1;
+                new_entry.WriteAccess     = 1;
+                new_entry.ExecuteAccess   = 0;
+                new_entry.PageFrameNumber = hook->OriginalPfn;
 
                 // Set MTF to catch the instruction after it executes, so we can restore the hook.
-                UINT32 cpu_controls = 0;
+                size_t cpu_controls = 0;
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
-                cpu_controls |= CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                cpu_controls |= (size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
 
                 vcpu->mtf_hook_state = hook;
@@ -666,11 +669,14 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 // Guest is trying to execute the read/write page.
                 // Swap to fake PFN with Execute-only access.
-                pml1->ReadAccess      = 0;
-                pml1->WriteAccess     = 0;
-                pml1->ExecuteAccess   = 1;
-                pml1->PageFrameNumber = hook->FakePfn;
+                new_entry.ReadAccess      = 0;
+                new_entry.WriteAccess     = 0;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->FakePfn;
             }
+
+            // Atomically update the EPT entry to prevent tearing
+            InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
 
             // Flush TLB for this specific core. (Since each core handles its own faults)
             ept_invept_single(vcpu->ept_pointer);
@@ -1072,9 +1078,9 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
     {
         // Disable MTF
-        UINT32 cpu_controls = 0;
+        size_t cpu_controls = 0;
         __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
-        cpu_controls &= ~CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+        cpu_controls &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
         __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
 
         // Restore execute-only access to the fake page
@@ -1090,10 +1096,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
             if (pml1)
             {
-                pml1->ReadAccess      = 0;
-                pml1->WriteAccess     = 0;
-                pml1->ExecuteAccess   = 1;
-                pml1->PageFrameNumber = hook->FakePfn;
+                EPT_PML1_ENTRY new_entry;
+                new_entry.AsUInt = pml1->AsUInt;
+                new_entry.ReadAccess      = 0;
+                new_entry.WriteAccess     = 0;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->FakePfn;
+
+                InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
 
                 ept_invept_single(vcpu->ept_pointer);
             }
