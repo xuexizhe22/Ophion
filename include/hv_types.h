@@ -70,6 +70,14 @@ typedef struct _VMM_EPT_DYNAMIC_SPLIT {
     LIST_ENTRY SplitList;
 } VMM_EPT_DYNAMIC_SPLIT, *PVMM_EPT_DYNAMIC_SPLIT;
 
+typedef struct _EPT_HOOK_STATE {
+    LIST_ENTRY ListEntry;
+    SIZE_T     OriginalPfn;
+    SIZE_T     FakePfn;
+    PVOID      OriginalVa;
+    PVOID      FakeVa;
+} EPT_HOOK_STATE, *PEPT_HOOK_STATE;
+
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
     UINT32                num_ranges;
@@ -142,6 +150,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // set when an NMI VM-exit interrupts IDT delivery of another event
     //
     BOOLEAN has_pending_nmi;
+
+    // EPT Hook MTF tracking
+    PEPT_HOOK_STATE mtf_hook_state;
 
     // guest DR0-DR3/DR6 saved on vm-exit, restored before vmresume
     UINT64  guest_dr0;

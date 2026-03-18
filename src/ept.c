@@ -423,6 +423,83 @@ ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     return &pml1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
 }
 
+BOOLEAN
+ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
+{
+    SIZE_T  target_pfn = phys_addr / PAGE_SIZE;
+    PVOID   target_va  = pa_to_va(phys_addr);
+
+    // Make sure we have a valid target PFN
+    if (!target_pfn)
+        return FALSE;
+
+    // Allocate the hook state
+    PEPT_HOOK_STATE hook = (PEPT_HOOK_STATE)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(EPT_HOOK_STATE), HV_POOL_TAG);
+
+    if (!hook)
+        return FALSE;
+
+    // Allocate physical memory for the fake page
+    PHYSICAL_ADDRESS high_addr = { 0 };
+    high_addr.QuadPart = MAXULONG64;
+    PVOID fake_page = MmAllocateContiguousMemory(PAGE_SIZE, high_addr);
+
+    if (!fake_page)
+    {
+        ExFreePoolWithTag(hook, HV_POOL_TAG);
+        return FALSE;
+    }
+
+    RtlZeroMemory(hook, sizeof(EPT_HOOK_STATE));
+
+    // Copy original memory contents to fake page
+    PVOID orig_page_va = pa_to_va(target_pfn * PAGE_SIZE);
+    RtlCopyMemory(fake_page, orig_page_va, PAGE_SIZE);
+
+    // Apply the patch to the fake page
+    SIZE_T offset_in_page = phys_addr & (PAGE_SIZE - 1);
+    RtlCopyMemory((PUCHAR)fake_page + offset_in_page, patch_bytes, patch_size);
+
+    hook->OriginalPfn = target_pfn;
+    hook->FakePfn     = va_to_pa(fake_page) / PAGE_SIZE;
+    hook->OriginalVa  = orig_page_va;
+    hook->FakeVa      = fake_page;
+
+    // Split large page and update PML1 across all cores
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        PVMM_EPT_PAGE_TABLE page_table = g_vcpu[i].ept_page_table;
+
+        PEPT_PML2_ENTRY pml2 = ept_get_pml2(page_table, phys_addr);
+        if (pml2 && pml2->LargePage)
+        {
+            ept_split_large_page(page_table, phys_addr);
+        }
+
+        PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, phys_addr);
+        if (pml1)
+        {
+            // Set up EPT entry to redirect execution to the fake page
+            pml1->ReadAccess      = 0;
+            pml1->WriteAccess     = 0;
+            pml1->ExecuteAccess   = 1;
+            pml1->PageFrameNumber = hook->FakePfn;
+        }
+    }
+
+    // Ensure thread safety. (In a real product we'd use a spinlock here)
+    InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
+
+    // Use DPC to cleanly invalidate EPT and process state on all cores
+    broadcast_update_ept();
+
+    DbgPrintEx(0, 0, "[hv] EPT Hook installed at PFN 0x%llx (Fake: 0x%llx)\n",
+               hook->OriginalPfn, hook->FakePfn);
+
+    return TRUE;
+}
+
 VOID
 ept_invept_single(EPT_POINTER ept_ptr)
 {
