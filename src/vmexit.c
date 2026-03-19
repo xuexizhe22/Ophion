@@ -620,8 +620,73 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 guest_phys = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
 
-    UNREFERENCED_PARAMETER(guest_phys);
+    VMX_EXIT_QUALIFICATION_EPT_VIOLATION qual;
+    qual.AsUInt = vcpu->exit_qual;
 
+    SIZE_T fault_pfn = guest_phys / PAGE_SIZE;
+
+    // Search for the hooked page
+    PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
+    PEPT_HOOK_STATE hook = NULL;
+
+    while (entry != &g_ept->hooked_pages)
+    {
+        PEPT_HOOK_STATE current = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
+        if (current->OriginalPfn == fault_pfn || current->FakePfn == fault_pfn)
+        {
+            hook = current;
+            break;
+        }
+        entry = entry->Flink;
+    }
+
+    if (hook)
+    {
+        PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, guest_phys);
+        if (pml1)
+        {
+            EPT_PML1_ENTRY new_entry;
+            new_entry.AsUInt = pml1->AsUInt;
+
+            if (qual.ReadAccess || qual.WriteAccess)
+            {
+                // Guest is trying to read/write the execute-only page.
+                // Swap back to original PFN with Read/Write access (Execute disabled).
+                new_entry.ReadAccess      = 1;
+                new_entry.WriteAccess     = 1;
+                new_entry.ExecuteAccess   = 0;
+                new_entry.PageFrameNumber = hook->OriginalPfn;
+
+                // Set MTF to catch the instruction after it executes, so we can restore the hook.
+                size_t cpu_controls = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
+                cpu_controls |= (size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
+
+                vcpu->mtf_hook_state = hook;
+            }
+            else if (qual.ExecuteAccess)
+            {
+                // Guest is trying to execute the read/write page.
+                // Swap to fake PFN with Execute-only access.
+                new_entry.ReadAccess      = 0;
+                new_entry.WriteAccess     = 0;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->FakePfn;
+            }
+
+            // Atomically update the EPT entry to prevent tearing
+            InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+
+            // Flush TLB for this specific core. (Since each core handles its own faults)
+            ept_invept_single(vcpu->ept_pointer);
+
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+    }
+
+    // Unhandled EPT violation (should not happen in identity map unless unmapped)
     vmexit_inject_gp();
     vcpu->advance_rip = FALSE;
 }
@@ -659,6 +724,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     switch (vmcall_num)
     {
     case VMCALL_TEST:
+        ept_invept_all();
         regs->rax = (UINT64)STATUS_SUCCESS;
         break;
 
@@ -1008,6 +1074,45 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EPT_VIOLATION:
         vmexit_handle_ept_violation(vcpu);
         break;
+
+    case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
+    {
+        // Disable MTF
+        size_t cpu_controls = 0;
+        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
+        cpu_controls &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
+
+        // Restore execute-only access to the fake page
+        if (vcpu->mtf_hook_state)
+        {
+            PEPT_HOOK_STATE hook = vcpu->mtf_hook_state;
+
+            // We need the physical address. We can just use the fake PFN to get the PML1 entry
+            // since the address mapping is identity mapped.
+            // (The identity map applies to physical addresses, so finding the PML1 for FakePfn * PAGE_SIZE
+            // or OriginalPfn * PAGE_SIZE resolves to the correct entry in the EPT.)
+
+            PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
+            if (pml1)
+            {
+                EPT_PML1_ENTRY new_entry;
+                new_entry.AsUInt = pml1->AsUInt;
+                new_entry.ReadAccess      = 0;
+                new_entry.WriteAccess     = 0;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->FakePfn;
+
+                InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+
+                ept_invept_single(vcpu->ept_pointer);
+            }
+            vcpu->mtf_hook_state = NULL;
+        }
+
+        vcpu->advance_rip = FALSE;
+        break;
+    }
 
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:
     {

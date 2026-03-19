@@ -10,6 +10,14 @@
 
 #define IOCTL_BASE      0x800
 #define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_EPT_HOOK CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _EPT_HOOK_REQUEST {
+    UINT32 ProcessId;
+    PVOID  VirtualAddress;
+    UCHAR  PatchBytes[16];
+    UINT32 PatchSize;
+} EPT_HOOK_REQUEST, *PEPT_HOOK_REQUEST;
 
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
@@ -131,6 +139,48 @@ DriverIoControl(
         {
             *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
             irp->IoStatus.Information = sizeof(UINT32);
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+
+    case IOCTL_HV_EPT_HOOK:
+    {
+        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(EPT_HOOK_REQUEST))
+        {
+            PEPT_HOOK_REQUEST req = (PEPT_HOOK_REQUEST)irp->AssociatedIrp.SystemBuffer;
+            PEPROCESS target_process = NULL;
+
+            status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req->ProcessId, &target_process);
+            if (NT_SUCCESS(status))
+            {
+                KAPC_STATE apc_state;
+                KeStackAttachProcess(target_process, &apc_state);
+
+                PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(req->VirtualAddress);
+
+                if (phys_addr.QuadPart != 0)
+                {
+                    if (ept_hook_page(phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                    {
+                        status = STATUS_SUCCESS;
+                    }
+                    else
+                    {
+                        status = STATUS_UNSUCCESSFUL;
+                    }
+                }
+                else
+                {
+                    status = STATUS_INVALID_ADDRESS;
+                }
+
+                KeUnstackDetachProcess(&apc_state);
+                ObDereferenceObject(target_process);
+            }
         }
         else
         {

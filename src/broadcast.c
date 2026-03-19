@@ -74,3 +74,25 @@ broadcast_terminate_all(VOID)
 {
     KeGenericCallDpc(dpc_terminate_guest, NULL);
 }
+
+static VOID
+dpc_update_ept(
+    _In_ PKDPC  Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0); // Trigger a VM-exit to allow hypervisor to process EPT changes and invalidate TLB
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+VOID
+broadcast_update_ept(VOID)
+{
+    KeGenericCallDpc(dpc_update_ept, NULL);
+}
