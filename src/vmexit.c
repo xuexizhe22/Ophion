@@ -686,7 +686,9 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
-    // Unhandled EPT violation (should not happen in identity map unless unmapped)
+    // Unhandled EPT violation.
+    // In our 1:1 identity map, an unhandled violation might be MMIO or other unmapped physical pages.
+    // We'll inject #GP to pass it to the guest.
     vmexit_inject_gp();
     vcpu->advance_rip = FALSE;
 }
@@ -724,7 +726,6 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     switch (vmcall_num)
     {
     case VMCALL_TEST:
-        ept_invept_all();
         regs->rax = (UINT64)STATUS_SUCCESS;
         break;
 

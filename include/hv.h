@@ -64,7 +64,7 @@ BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
-VOID ept_invept_all(VOID);
+ULONG_PTR ept_invept_all(ULONG_PTR Context);
 VOID vpid_invvpid_single(UINT16 vpid);
 
 BOOLEAN vmexit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
@@ -93,7 +93,6 @@ VOID vmexit_inject_pf(UINT32 error_code, UINT64 fault_addr);
 
 VOID broadcast_virtualize_all(VOID);
 VOID broadcast_terminate_all(VOID);
-VOID broadcast_update_ept(VOID);
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING registry_path);
 VOID     DriverUnload(PDRIVER_OBJECT driver_obj);

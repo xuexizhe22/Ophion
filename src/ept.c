@@ -491,8 +491,9 @@ ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
     // Ensure thread safety. (In a real product we'd use a spinlock here)
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
 
-    // Use DPC to cleanly invalidate EPT and process state on all cores
-    broadcast_update_ept();
+    // Broadcast an IPI to invalidate the EPT TLB on all cores safely without deadlocking DPCs.
+    // In Windows Kernel, KeIpiGenericCall takes a ULONG_PTR context.
+    KeIpiGenericCall((PKIPI_BROADCAST_WORKER)ept_invept_all, 0);
 
     DbgPrintEx(0, 0, "[hv] EPT Hook installed at PFN 0x%llx (Fake: 0x%llx)\n",
                hook->OriginalPfn, hook->FakePfn);
@@ -508,11 +509,13 @@ ept_invept_single(EPT_POINTER ept_ptr)
     asm_invept(InveptSingleContext, &desc);
 }
 
-VOID
-ept_invept_all(VOID)
+ULONG_PTR
+ept_invept_all(ULONG_PTR Context)
 {
+    UNREFERENCED_PARAMETER(Context);
     INVEPT_DESCRIPTOR desc = {0};
     asm_invept(InveptAllContexts, &desc);
+    return 0;
 }
 
 VOID

@@ -4,6 +4,7 @@
 *   provides ioctl interface for usermode loader communication
 */
 #include "hv.h"
+#include <ntifs.h>
 
 #define DEVICE_NAME     L"\\Device\\Ophion"
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
@@ -154,28 +155,59 @@ DriverIoControl(
             PEPT_HOOK_REQUEST req = (PEPT_HOOK_REQUEST)irp->AssociatedIrp.SystemBuffer;
             PEPROCESS target_process = NULL;
 
+            // Validate that the patch won't overflow a page boundary
+            SIZE_T offset = (SIZE_T)req->VirtualAddress & (PAGE_SIZE - 1);
+            if (offset + req->PatchSize > PAGE_SIZE || req->PatchSize > sizeof(req->PatchBytes))
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
             status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req->ProcessId, &target_process);
             if (NT_SUCCESS(status))
             {
                 KAPC_STATE apc_state;
                 KeStackAttachProcess(target_process, &apc_state);
 
-                PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(req->VirtualAddress);
-
-                if (phys_addr.QuadPart != 0)
+                // Lock the page in memory so it isn't paged out while hooked
+                PMDL mdl = IoAllocateMdl(req->VirtualAddress, req->PatchSize, FALSE, FALSE, NULL);
+                if (mdl)
                 {
-                    if (ept_hook_page(phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                    __try
                     {
-                        status = STATUS_SUCCESS;
+                        MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+
+                        PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(req->VirtualAddress);
+
+                        if (phys_addr.QuadPart != 0)
+                        {
+                            if (ept_hook_page(phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                            {
+                                status = STATUS_SUCCESS;
+                            }
+                            else
+                            {
+                                MmUnlockPages(mdl);
+                                IoFreeMdl(mdl);
+                                status = STATUS_UNSUCCESSFUL;
+                            }
+                        }
+                        else
+                        {
+                            MmUnlockPages(mdl);
+                            IoFreeMdl(mdl);
+                            status = STATUS_INVALID_ADDRESS;
+                        }
                     }
-                    else
+                    __except (EXCEPTION_EXECUTE_HANDLER)
                     {
-                        status = STATUS_UNSUCCESSFUL;
+                        IoFreeMdl(mdl);
+                        status = GetExceptionCode();
                     }
                 }
                 else
                 {
-                    status = STATUS_INVALID_ADDRESS;
+                    status = STATUS_INSUFFICIENT_RESOURCES;
                 }
 
                 KeUnstackDetachProcess(&apc_state);
