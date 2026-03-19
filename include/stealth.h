@@ -25,7 +25,7 @@
 // the VM-exit overhead, then RDTSC exiting is disabled. zero drift —
 // TSC_OFFSET is never modified, only one RDTSC per CPUID is trapped.
 //
-#define STEALTH_COMPENSATE_TIMING           0
+#define STEALTH_COMPENSATE_TIMING           1
 
 //
 // use cached bare-metal CPUID for invalid/hypervisor leaves
