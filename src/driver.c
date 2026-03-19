@@ -4,7 +4,39 @@
 *   provides ioctl interface for usermode loader communication
 */
 #include "hv.h"
-#include <ntifs.h>
+
+// ==========================================
+// Manually declare Windows Kernel APIs to avoid C2371 redefinition
+// conflicts between ntddk.h and ntifs.h in WDK 10.0.26100.0.
+// ==========================================
+NTKERNELAPI
+NTSTATUS
+PsLookupProcessByProcessId(
+    _In_ HANDLE ProcessId,
+    _Outptr_ PEPROCESS *Process
+    );
+
+typedef struct _KAPC_STATE {
+    LIST_ENTRY ApcListHead[2];
+    struct _KPROCESS *Process;
+    UCHAR KernelApcInProgress;
+    UCHAR KernelApcPending;
+    UCHAR UserApcPending;
+} KAPC_STATE, *PKAPC_STATE, *PRKAPC_STATE;
+
+NTKERNELAPI
+VOID
+KeStackAttachProcess (
+    _Inout_ PRKPROCESS PROCESS,
+    _Out_ PRKAPC_STATE ApcState
+    );
+
+NTKERNELAPI
+VOID
+KeUnstackDetachProcess (
+    _In_ PRKAPC_STATE ApcState
+    );
+// ==========================================
 
 #define DEVICE_NAME     L"\\Device\\Ophion"
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
@@ -169,8 +201,10 @@ DriverIoControl(
                 KAPC_STATE apc_state;
                 KeStackAttachProcess(target_process, &apc_state);
 
-                // Lock the page in memory so it isn't paged out while hooked
-                PMDL mdl = IoAllocateMdl(req->VirtualAddress, req->PatchSize, FALSE, FALSE, NULL);
+                // Lock the ENTIRE PAGE in memory so it isn't paged out while being hooked and copied.
+                // Locking only PatchSize would allow the rest of the page to be paged out, causing BSODs.
+                PVOID page_va = (PVOID)((ULONG_PTR)req->VirtualAddress & ~(PAGE_SIZE - 1));
+                PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
                 if (mdl)
                 {
                     __try
@@ -181,7 +215,7 @@ DriverIoControl(
 
                         if (phys_addr.QuadPart != 0)
                         {
-                            if (ept_hook_page(phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                            if (ept_hook_page(req->VirtualAddress, phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
                             {
                                 status = STATUS_SUCCESS;
                             }

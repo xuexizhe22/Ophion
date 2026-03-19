@@ -424,10 +424,9 @@ ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 }
 
 BOOLEAN
-ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
+ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
 {
     SIZE_T  target_pfn = phys_addr / PAGE_SIZE;
-    PVOID   target_va  = pa_to_va(phys_addr);
 
     // Make sure we have a valid target PFN
     if (!target_pfn)
@@ -453,8 +452,10 @@ ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
 
     RtlZeroMemory(hook, sizeof(EPT_HOOK_STATE));
 
-    // Copy original memory contents to fake page
-    PVOID orig_page_va = pa_to_va(target_pfn * PAGE_SIZE);
+    // Fix: pa_to_va fails and returns NULL for user-mode physical addresses because
+    // MmGetVirtualForPhysical is only guaranteed to work for nonpaged pool (kernel memory).
+    // Copy original memory contents using the user-provided and attached virtual address instead.
+    PVOID orig_page_va = (PVOID)((ULONG_PTR)user_va & ~(PAGE_SIZE - 1));
     RtlCopyMemory(fake_page, orig_page_va, PAGE_SIZE);
 
     // Apply the patch to the fake page

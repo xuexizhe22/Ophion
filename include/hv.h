@@ -61,7 +61,7 @@ PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 
-BOOLEAN ept_hook_page(SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size);
+BOOLEAN ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 ULONG_PTR ept_invept_all(ULONG_PTR Context);
