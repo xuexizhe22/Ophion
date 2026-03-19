@@ -211,26 +211,40 @@ DriverIoControl(
                     {
                         MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
 
-                        PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(req->VirtualAddress);
-
-                        if (phys_addr.QuadPart != 0)
+                        PVOID system_va = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+                        if (system_va)
                         {
-                            if (ept_hook_page(req->VirtualAddress, phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                            PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(system_va);
+
+                            if (phys_addr.QuadPart != 0)
                             {
-                                status = STATUS_SUCCESS;
+                                // Calculate the offset within the page
+                                SIZE_T offset = (ULONG_PTR)req->VirtualAddress & (PAGE_SIZE - 1);
+                                PVOID target_system_va = (PVOID)((ULONG_PTR)system_va + offset);
+
+                                if (ept_hook_page(target_system_va, phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
+                                {
+                                    status = STATUS_SUCCESS;
+                                }
+                                else
+                                {
+                                    MmUnlockPages(mdl);
+                                    IoFreeMdl(mdl);
+                                    status = STATUS_UNSUCCESSFUL;
+                                }
                             }
                             else
                             {
                                 MmUnlockPages(mdl);
                                 IoFreeMdl(mdl);
-                                status = STATUS_UNSUCCESSFUL;
+                                status = STATUS_INVALID_ADDRESS;
                             }
                         }
                         else
                         {
                             MmUnlockPages(mdl);
                             IoFreeMdl(mdl);
-                            status = STATUS_INVALID_ADDRESS;
+                            status = STATUS_INSUFFICIENT_RESOURCES;
                         }
                     }
                     __except (EXCEPTION_EXECUTE_HANDLER)
