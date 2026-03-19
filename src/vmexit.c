@@ -307,9 +307,20 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
     }
     else
     {
-        vmexit_inject_gp();
-        vcpu->advance_rip = FALSE;
-        return;
+        // Many undocumented or OEM MSRs are probed by the Windows kernel (e.g., thermal, power management).
+        // Instead of injecting a fatal #GP into the guest which causes bugchecks,
+        // we attempt to pass through the read using a SEH handler to catch genuinely invalid reads safely.
+        __try
+        {
+            msr.Flags = __readmsr(target_msr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // If the actual CPU #GPs on this MSR, then we must reflect that #GP to the guest.
+            vmexit_inject_gp();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
     }
 }
 
@@ -368,15 +379,31 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
             break;
 
         default:
-            __writemsr(target_msr, msr.Flags);
+            __try
+            {
+                __writemsr(target_msr, msr.Flags);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
             break;
         }
     }
     else
     {
-        vmexit_inject_gp();
-        vcpu->advance_rip = FALSE;
-        return;
+        __try
+        {
+            __writemsr(target_msr, msr.Flags);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            vmexit_inject_gp();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
     }
 }
 
