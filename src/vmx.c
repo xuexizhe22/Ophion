@@ -519,24 +519,11 @@ vmx_init(VOID)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
 
-        //
-        // intercept RDMSR(0x10) — IA32_TIME_STAMP_COUNTER
-        // per SDM 27.6.5, "use TSC offsetting" applies the offset to RDMSR(0x10)
-        // automatically. interception is only needed so the TSC compensation path
-        // can cover RDMSR-based timing attacks alongside RDTSC.
-        //
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
-
-        // IA32_FEATURE_CONTROL read+write
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-
-        // VMX capability MSRs (0x480-0x493) read+write
-        for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
-        {
-            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
-            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
-        }
+        // Note: MSR interception is disabled here because the original MSR spoofing
+        // causes KMODE_EXCEPTION_NOT_HANDLED (0x1E) STATUS_PRIVILEGED_INSTRUCTION
+        // bugchecks on newer Windows 10 kernels during nt!PpmIdleGuestExecute.
+        // Since we are only focused on testing the EPT Stealth Hook POC, we leave
+        // the MSR bitmap all zeros to allow the guest native access to all MSRs.
 
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
