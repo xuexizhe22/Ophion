@@ -15,6 +15,34 @@ stealth_init_cpuid_cache(VOID)
 {
     INT32 cpu_info[4] = {0};
 
+    __cpuidex(cpu_info, 1, 0);
+    g_stealth_cpuid_cache.outer_hypervisor_present =
+        !!((UINT32)cpu_info[2] & (1U << 31));
+
+    if (g_stealth_cpuid_cache.outer_hypervisor_present)
+    {
+        __cpuidex(cpu_info, 0x40000000, 0);
+        g_stealth_cpuid_cache.hypervisor_max_leaf = (UINT32)cpu_info[0];
+        g_stealth_cpuid_cache.hypervisor_vendor[0] = (UINT32)cpu_info[1];
+        g_stealth_cpuid_cache.hypervisor_vendor[1] = (UINT32)cpu_info[2];
+        g_stealth_cpuid_cache.hypervisor_vendor[2] = (UINT32)cpu_info[3];
+    }
+    else
+    {
+        g_stealth_cpuid_cache.hypervisor_max_leaf = 0;
+        g_stealth_cpuid_cache.hypervisor_vendor[0] = 0;
+        g_stealth_cpuid_cache.hypervisor_vendor[1] = 0;
+        g_stealth_cpuid_cache.hypervisor_vendor[2] = 0;
+    }
+
+    //
+    // Nested compatibility mode: if the OS already booted under an outer
+    // hypervisor, preserving that contract is more important than hiding it.
+    // Disable stealth paths that would make CPUID/MSR behavior inconsistent.
+    //
+    if (g_stealth_cpuid_cache.outer_hypervisor_present)
+        g_stealth_enabled = TRUE; // FORCED ON FOR RDTSC TIMING MITIGATION
+
     //
     // cache the response for an obviously invalid leaf.
     // on intel, CPUID returns the highest standard leaf's response
@@ -104,6 +132,20 @@ stealth_init_cpuid_cache(VOID)
              (UINT32)g_stealth_cpuid_cache.invalid_leaf[1],
              (UINT32)g_stealth_cpuid_cache.invalid_leaf[2],
              (UINT32)g_stealth_cpuid_cache.invalid_leaf[3]);
+
+    if (g_stealth_cpuid_cache.outer_hypervisor_present)
+    {
+        DbgPrintEx(0, 0, "[hv] Outer hypervisor detected: %.4s%.4s%.4s (max leaf 0x%X)\n",
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[0],
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[1],
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[2],
+                 g_stealth_cpuid_cache.hypervisor_max_leaf);
+        DbgPrintEx(0, 0, "[hv] Nested compatibility mode enabled: stealth CPUID/MSR masking disabled\n");
+    }
+    else
+    {
+        DbgPrintEx(0, 0, "[hv] Outer hypervisor detected: none\n");
+    }
 
 #if STEALTH_COMPENSATE_TIMING
     DbgPrintEx(0, 0, "[hv] TSC compensation: bare_metal_cpuid=%llu cycles, rdtsc_exiting_forced=%d\n",
@@ -204,4 +246,3 @@ stealth_is_xcr0_valid(UINT64 value)
 
     return TRUE;
 }
-

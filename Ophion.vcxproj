@@ -25,6 +25,7 @@
     <UseDebugLibraries>false</UseDebugLibraries>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
+    <SignMode>Off</SignMode>
   </PropertyGroup>
   <!-- Configuration: x64 Debug (Kernel Mode) -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -33,6 +34,7 @@
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <UseDebugLibraries>true</UseDebugLibraries>
     <CharacterSet>Unicode</CharacterSet>
+    <SignMode>Off</SignMode>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -46,8 +48,6 @@
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
     <TargetName>Ophion</TargetName>
     <TargetExt>.sys</TargetExt>
-    <SignMode>TestSign</SignMode>
-    <TestCertificate>26F9E348962C59621D11296D690DD6D13E6B93DB</TestCertificate>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <DriverSign>
@@ -76,6 +76,10 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
+    <PostBuildEvent>
+      <Message>Test-signing driver with local Ophion PFX</Message>
+      <Command>"$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64\signtool.exe" sign /fd SHA256 /f "$(ProjectDir)build\OphionTestCert.pfx" /p "OphionTest123!" "$(TargetPath)"</Command>
+    </PostBuildEvent>
     <MASM>
       <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
@@ -96,6 +100,10 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
+    <PostBuildEvent>
+      <Message>Test-signing driver with local Ophion PFX</Message>
+      <Command>"$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64\signtool.exe" sign /fd SHA256 /f "$(ProjectDir)build\OphionTestCert.pfx" /p "OphionTest123!" "$(TargetPath)"</Command>
+    </PostBuildEvent>
     <MASM>
       <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>

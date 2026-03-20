@@ -164,6 +164,7 @@ BOOLEAN
 vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 {
     UINT32                  pri_proc;
+    UINT32                  pri_proc_requested;
     UINT32                  sec_proc;
     UINT64                  gdt_base;
     IA32_VMX_BASIC_REGISTER vmx_basic     = {0};
@@ -208,18 +209,23 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_GUEST_FS_BASE, __readmsr(IA32_FS_BASE));
     __vmx_vmwrite(VMCS_GUEST_GS_BASE, __readmsr(IA32_GS_BASE));
 
-    pri_proc = vmx_adjust_controls(
+    pri_proc_requested =
         CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING |
-        CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS |
         CPU_BASED_VM_EXEC_CTRL_USE_IO_BITMAPS |
-        CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS,
+        CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS;
+
+    if (!g_stealth_cpuid_cache.outer_hypervisor_present)
+        pri_proc_requested |= CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS;
+
+    pri_proc = vmx_adjust_controls(
+        pri_proc_requested,
         vmx_basic.VmxControls ? IA32_VMX_TRUE_PROCBASED_CTLS : IA32_VMX_PROCBASED_CTLS);
 
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pri_proc);
 
     vcpu->mov_dr_exiting = !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING);
 
-    DbgPrintEx(0, 0, "[hv] Primary proc controls: 0x%08X (CR3load=%d CR3store=%d INVLPG=%d HLT=%d RDTSC=%d MOVDR=%d TSCoff=%d)\n",
+    DbgPrintEx(0, 0, "[hv] Primary proc controls: 0x%08X (CR3load=%d CR3store=%d INVLPG=%d HLT=%d RDTSC=%d MOVDR=%d TSCoff=%d MSRBitmap=%d)\n",
              pri_proc,
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING),
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING),
@@ -227,7 +233,8 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_HLT_EXITING),
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING),
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING));
+             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING),
+             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS));
 
     sec_proc = vmx_adjust_controls(
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT |
@@ -418,6 +425,10 @@ vmx_virtualize_cpu(PVOID guest_stack)
     UINT64                  error_code   = 0;
 
     vcpu->core_id = core;
+    vcpu->in_root = FALSE;
+    vcpu->vmx_active = FALSE;
+    vcpu->launched = FALSE;
+    vcpu->vmxoff.executed = FALSE;
 
     asm_enable_vmx();
     vmx_set_fixed_bits();
@@ -428,11 +439,22 @@ vmx_virtualize_cpu(PVOID guest_stack)
         return FALSE;
     }
 
+    vcpu->vmx_active = TRUE;
+
     if (!vmx_clear_vmcs(vcpu))
+    {
+        vcpu->vmx_active = FALSE;
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
         return FALSE;
+    }
 
     if (!vmx_load_vmcs(vcpu))
+    {
+        __vmx_off();
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+        vcpu->vmx_active = FALSE;
         return FALSE;
+    }
 
     vmx_setup_vmcs(vcpu, guest_stack);
 
@@ -446,6 +468,8 @@ vmx_virtualize_cpu(PVOID guest_stack)
     vcpu->launched = FALSE;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
+    __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+    vcpu->vmx_active = FALSE;
 
     DbgPrintEx(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
     return FALSE;
@@ -519,11 +543,24 @@ vmx_init(VOID)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
 
-        // Note: MSR interception is disabled here because the original MSR spoofing
-        // causes KMODE_EXCEPTION_NOT_HANDLED (0x1E) STATUS_PRIVILEGED_INSTRUCTION
-        // bugchecks on newer Windows 10 kernels during nt!PpmIdleGuestExecute.
-        // Since we are only focused on testing the EPT Stealth Hook POC, we leave
-        // the MSR bitmap all zeros to allow the guest native access to all MSRs.
+        //
+        // intercept RDMSR(0x10) — IA32_TIME_STAMP_COUNTER
+        // per SDM 27.6.5, "use TSC offsetting" applies the offset to RDMSR(0x10)
+        // automatically. interception is only needed so the TSC compensation path
+        // can cover RDMSR-based timing attacks alongside RDTSC.
+        //
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
+
+        // IA32_FEATURE_CONTROL read+write
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+
+        // VMX capability MSRs (0x480-0x493) read+write
+        for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
+        {
+            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+        }
 
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
@@ -624,6 +661,8 @@ vmx_terminate(VOID)
 
     if (g_ept)
     {
+        ept_cleanup_state();
+
         for (UINT32 i = 0; i < g_cpu_count; i++)
         {
             if (g_vcpu[i].ept_page_table)

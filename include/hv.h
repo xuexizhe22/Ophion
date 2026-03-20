@@ -6,7 +6,7 @@
 //
 // windows kernel headers (used only at PASSIVE/DPC level in non-root)
 //
-#include <ntddk.h>
+#include <ntifs.h>
 #include <intrin.h>
 
 #include "ia32.h"
@@ -52,6 +52,8 @@ UINT64  vmx_return_rip_for_vmxoff(VOID);
 BOOLEAN ept_check_features(VOID);
 BOOLEAN ept_build_mtrr_map(VOID);
 BOOLEAN ept_init(VOID);
+VOID    ept_cleanup_state(VOID);
+BOOLEAN ept_unhook_process(HANDLE process_id);
 PVMM_EPT_PAGE_TABLE ept_alloc_identity_map(VOID);
 UINT8   ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page);
 BOOLEAN ept_valid_for_large_page(SIZE_T pfn);
@@ -61,10 +63,19 @@ PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 
-BOOLEAN ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size);
+BOOLEAN ept_hook_page(
+    SIZE_T phys_addr,
+    PVOID source_page_va,
+    PVOID target_page_base,
+    UINT64 target_cr3,
+    SIZE_T patch_offset,
+    PVOID patch_bytes,
+    SIZE_T patch_size,
+    PMDL locked_mdl,
+    HANDLE process_id);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
-ULONG_PTR ept_invept_all(ULONG_PTR Context);
+VOID ept_invept_all(VOID);
 VOID vpid_invvpid_single(UINT16 vpid);
 
 BOOLEAN vmexit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
@@ -93,6 +104,8 @@ VOID vmexit_inject_pf(UINT32 error_code, UINT64 fault_addr);
 
 VOID broadcast_virtualize_all(VOID);
 VOID broadcast_terminate_all(VOID);
+VOID broadcast_update_ept(VOID);
+
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING registry_path);
 VOID     DriverUnload(PDRIVER_OBJECT driver_obj);

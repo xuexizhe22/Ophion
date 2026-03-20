@@ -74,8 +74,15 @@ typedef struct _EPT_HOOK_STATE {
     LIST_ENTRY ListEntry;
     SIZE_T     OriginalPfn;
     SIZE_T     FakePfn;
-    PVOID      OriginalVa;
+    BOOLEAN    Enabled;
+    UINT64     TargetCr3;
+    PVOID      TargetPageBase;
+    PVOID      OriginalPageVa;
     PVOID      FakeVa;
+    PMDL       LockedMdl;
+    HANDLE     ProcessId;
+    SIZE_T     PatchOffset;
+    SIZE_T     PatchSize;
 } EPT_HOOK_STATE, *PEPT_HOOK_STATE;
 
 typedef struct _EPT_STATE {
@@ -83,7 +90,8 @@ typedef struct _EPT_STATE {
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
-    LIST_ENTRY            hooked_pages;    // reserved for future EPT hooks
+    LIST_ENTRY            hooked_pages;    // active EPT hooks
+    LIST_ENTRY            dynamic_splits;  // split PML1 tables allocated on demand
 
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
@@ -123,6 +131,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64      exit_qual;
     UINT64      vmexit_rip;
     BOOLEAN     in_root;
+    BOOLEAN     vmx_active;
     BOOLEAN     launched;
     BOOLEAN     advance_rip;
 

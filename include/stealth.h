@@ -38,7 +38,7 @@
 // protects host-mode from guest/anti-cheat page table corruption
 // disabled by default — enable once base hv is verified stable
 //
-#define USE_PRIVATE_HOST_CR3                1
+#define USE_PRIVATE_HOST_CR3                0
 
 //
 // CR4.VMXE — bit 13 (may already be defined in ia32.h)
@@ -83,6 +83,15 @@ typedef struct _STEALTH_CPUID_CACHE {
     BOOLEAN initialized;
 
     //
+    // set before VMXON: tells us whether we are already running under an
+    // outer hypervisor (for example VMware nested VT-x). In that case,
+    // synthetic MSRs should usually be passed through instead of forced #GP.
+    //
+    BOOLEAN outer_hypervisor_present;
+    UINT32  hypervisor_max_leaf;
+    UINT32  hypervisor_vendor[3];
+
+    //
     // calibrated bare-metal CPUID execution cost (min of N samples)
     // used by TSC compensation to return plausible RDTSC deltas
     //
@@ -104,4 +113,3 @@ VOID stealth_init_cpuid_cache(VOID);
 BOOLEAN stealth_is_leaf_invalid(UINT32 leaf);
 
 BOOLEAN stealth_is_xcr0_valid(UINT64 value);
-

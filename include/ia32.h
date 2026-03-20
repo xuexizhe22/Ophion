@@ -485,6 +485,8 @@ typedef union _MSR {
 #define VMCS_CTRL_CR0_READ_SHADOW                    0x00006004
 #define VMCS_CTRL_CR4_READ_SHADOW                    0x00006006
 #define VMCS_EXIT_QUALIFICATION                      0x00006400
+#define VMCS_GUEST_LINEAR_ADDRESS                    0x0000640A
+#define VMCS_GUEST_LINEAR_ADDRESS                    0x0000640A
 
 //
 // Natural-Width Guest-State Fields

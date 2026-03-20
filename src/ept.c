@@ -5,6 +5,101 @@
 */
 #include "hv.h"
 
+static PEPT_HOOK_STATE
+ept_find_hook_by_original_pfn(SIZE_T original_pfn)
+{
+    if (!g_ept)
+        return NULL;
+
+    for (PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
+         entry != &g_ept->hooked_pages;
+         entry = entry->Flink)
+    {
+        PEPT_HOOK_STATE hook = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
+        if (hook->OriginalPfn == original_pfn)
+        {
+            return hook;
+        }
+    }
+
+    return NULL;
+}
+
+static PVMM_EPT_DYNAMIC_SPLIT
+ept_find_dynamic_split(_In_ PEPT_PML2_ENTRY target_entry)
+{
+    if (!g_ept || !target_entry)
+        return NULL;
+
+    for (PLIST_ENTRY entry = g_ept->dynamic_splits.Flink;
+         entry != &g_ept->dynamic_splits;
+         entry = entry->Flink)
+    {
+        PVMM_EPT_DYNAMIC_SPLIT split = CONTAINING_RECORD(entry, VMM_EPT_DYNAMIC_SPLIT, SplitList);
+        if (split->u.Entry == target_entry)
+        {
+            return split;
+        }
+    }
+
+    return NULL;
+}
+
+static VOID
+ept_release_hook(_In_ PEPT_HOOK_STATE hook)
+{
+    if (!hook)
+        return;
+
+    if (hook->LockedMdl)
+    {
+        MmUnlockPages(hook->LockedMdl);
+        IoFreeMdl(hook->LockedMdl);
+    }
+
+    if (hook->FakeVa)
+    {
+        MmFreeContiguousMemory(hook->FakeVa);
+    }
+
+    ExFreePoolWithTag(hook, HV_POOL_TAG);
+}
+
+static VOID
+ept_disable_hook(_In_ PEPT_HOOK_STATE hook)
+{
+    if (!hook || !hook->Enabled)
+        return;
+
+    hook->Enabled = FALSE;
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        PVMM_EPT_PAGE_TABLE page_table = g_vcpu[i].ept_page_table;
+        PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, hook->OriginalPfn * PAGE_SIZE);
+
+        if (g_vcpu[i].mtf_hook_state == hook)
+        {
+            g_vcpu[i].mtf_hook_state = NULL;
+        }
+
+        if (!pml1)
+            continue;
+
+        EPT_PML1_ENTRY new_entry;
+        new_entry.AsUInt = pml1->AsUInt;
+        new_entry.ReadAccess      = 1;
+        new_entry.WriteAccess     = 1;
+        new_entry.ExecuteAccess   = 1;
+        new_entry.PageFrameNumber = hook->OriginalPfn;
+
+        InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+    }
+
+    hook->TargetCr3 = 0;
+    hook->TargetPageBase = NULL;
+}
+
 BOOLEAN
 ept_check_features(VOID)
 {
@@ -300,6 +395,7 @@ ept_init(VOID)
     RtlZeroMemory(g_ept, sizeof(EPT_STATE));
 
     InitializeListHead(&g_ept->hooked_pages);
+    InitializeListHead(&g_ept->dynamic_splits);
 
     if (!ept_check_features())
         return FALSE;
@@ -379,6 +475,7 @@ ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     new_ptr.PageFrameNumber   = va_to_pa(&new_split->PML1[0]) / PAGE_SIZE;
 
     RtlCopyMemory(target, &new_ptr, sizeof(new_ptr));
+    InsertTailList(&g_ept->dynamic_splits, &new_split->SplitList);
 
     return TRUE;
 }
@@ -413,33 +510,68 @@ ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     if (pml2->LargePage)
         return NULL;  // not split
 
-    PEPT_PML2_POINTER ptr = (PEPT_PML2_POINTER)pml2;
-    PEPT_PML1_ENTRY pml1 = (PEPT_PML1_ENTRY)pa_to_va(
-        ptr->PageFrameNumber * PAGE_SIZE);
-
-    if (!pml1)
+    PVMM_EPT_DYNAMIC_SPLIT split = ept_find_dynamic_split(pml2);
+    if (!split)
         return NULL;
 
-    return &pml1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
+    return &split->PML1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
 }
 
 BOOLEAN
-ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_size)
+ept_hook_page(
+    SIZE_T phys_addr,
+    PVOID source_page_va,
+    PVOID target_page_base,
+    UINT64 target_cr3,
+    SIZE_T patch_offset,
+    PVOID patch_bytes,
+    SIZE_T patch_size,
+    PMDL locked_mdl,
+    HANDLE process_id)
 {
-    SIZE_T  target_pfn = phys_addr / PAGE_SIZE;
+    SIZE_T target_pfn = phys_addr / PAGE_SIZE;
 
-    // Make sure we have a valid target PFN
-    if (!target_pfn)
+    if (!target_pfn || !source_page_va || !patch_bytes || !locked_mdl)
         return FALSE;
 
-    // Allocate the hook state
+    if (patch_size == 0 || patch_offset >= PAGE_SIZE || (patch_offset + patch_size) > PAGE_SIZE)
+        return FALSE;
+
+    PEPT_HOOK_STATE existing_hook = ept_find_hook_by_original_pfn(target_pfn);
+    if (existing_hook)
+    {
+        RtlCopyMemory(existing_hook->FakeVa, source_page_va, PAGE_SIZE);
+        RtlCopyMemory((PUCHAR)existing_hook->FakeVa + patch_offset, patch_bytes, patch_size);
+
+        if (existing_hook->LockedMdl)
+        {
+            MmUnlockPages(existing_hook->LockedMdl);
+            IoFreeMdl(existing_hook->LockedMdl);
+        }
+
+        existing_hook->Enabled        = TRUE;
+        existing_hook->OriginalPageVa = source_page_va;
+        existing_hook->TargetPageBase = target_page_base;
+        existing_hook->TargetCr3      = target_cr3 & ~0xFFFULL;
+        existing_hook->LockedMdl      = locked_mdl;
+        existing_hook->ProcessId      = process_id;
+        existing_hook->PatchOffset    = patch_offset;
+        existing_hook->PatchSize      = patch_size;
+
+        // Make sure every CPU sees the refreshed fake page contents.
+        asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
+
+        DbgPrintEx(0, 0, "[hv] EPT Hook refreshed for PFN 0x%llx (PID=%p, offset=0x%Ix, size=0x%Ix)\n",
+                   existing_hook->OriginalPfn, existing_hook->ProcessId, existing_hook->PatchOffset, existing_hook->PatchSize);
+        return TRUE;
+    }
+
     PEPT_HOOK_STATE hook = (PEPT_HOOK_STATE)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(EPT_HOOK_STATE), HV_POOL_TAG);
 
     if (!hook)
         return FALSE;
 
-    // Allocate physical memory for the fake page
     PHYSICAL_ADDRESS high_addr = { 0 };
     high_addr.QuadPart = MAXULONG64;
     PVOID fake_page = MmAllocateContiguousMemory(PAGE_SIZE, high_addr);
@@ -451,21 +583,19 @@ ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_s
     }
 
     RtlZeroMemory(hook, sizeof(EPT_HOOK_STATE));
-
-    // Fix: pa_to_va fails and returns NULL for user-mode physical addresses because
-    // MmGetVirtualForPhysical is only guaranteed to work for nonpaged pool (kernel memory).
-    // Copy original memory contents using the user-provided and attached virtual address instead.
-    PVOID orig_page_va = (PVOID)((ULONG_PTR)user_va & ~(PAGE_SIZE - 1));
-    RtlCopyMemory(fake_page, orig_page_va, PAGE_SIZE);
-
-    // Apply the patch to the fake page
-    SIZE_T offset_in_page = phys_addr & (PAGE_SIZE - 1);
-    RtlCopyMemory((PUCHAR)fake_page + offset_in_page, patch_bytes, patch_size);
+    RtlCopyMemory(fake_page, source_page_va, PAGE_SIZE);
+    RtlCopyMemory((PUCHAR)fake_page + patch_offset, patch_bytes, patch_size);
 
     hook->OriginalPfn = target_pfn;
     hook->FakePfn     = va_to_pa(fake_page) / PAGE_SIZE;
-    hook->OriginalVa  = orig_page_va;
+    hook->Enabled     = TRUE;
+    hook->TargetCr3   = target_cr3 & ~0xFFFULL;
+    hook->TargetPageBase = target_page_base;
+    hook->OriginalPageVa = source_page_va;
     hook->FakeVa      = fake_page;
+    hook->ProcessId   = process_id;
+    hook->PatchOffset = patch_offset;
+    hook->PatchSize   = patch_size;
 
     // Split large page and update PML1 across all cores
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -475,7 +605,13 @@ ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_s
         PEPT_PML2_ENTRY pml2 = ept_get_pml2(page_table, phys_addr);
         if (pml2 && pml2->LargePage)
         {
-            ept_split_large_page(page_table, phys_addr);
+            if (!ept_split_large_page(page_table, phys_addr))
+            {
+                DbgPrintEx(0, 0, "[hv] EPT Hook failed: split_large_page failed on CPU %u for PA 0x%llx\n",
+                         i, phys_addr);
+                ept_release_hook(hook);
+                return FALSE;
+            }
         }
 
         PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, phys_addr);
@@ -487,19 +623,82 @@ ept_hook_page(PVOID user_va, SIZE_T phys_addr, PVOID patch_bytes, SIZE_T patch_s
             pml1->ExecuteAccess   = 1;
             pml1->PageFrameNumber = hook->FakePfn;
         }
+        else
+        {
+            DbgPrintEx(0, 0, "[hv] EPT Hook failed: PML1 lookup failed on CPU %u for PA 0x%llx\n",
+                     i, phys_addr);
+            ept_release_hook(hook);
+            return FALSE;
+        }
     }
 
-    // Ensure thread safety. (In a real product we'd use a spinlock here)
+
+
+    hook->LockedMdl = locked_mdl;
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
 
-    // Broadcast an IPI to invalidate the EPT TLB on all cores safely without deadlocking DPCs.
-    // In Windows Kernel, KeIpiGenericCall takes a ULONG_PTR context.
-    KeIpiGenericCall((PKIPI_BROADCAST_WORKER)ept_invept_all, 0);
+    // Trigger a VM-exit on the current CPU so INVEPT can make the new mapping visible.
+    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
 
-    DbgPrintEx(0, 0, "[hv] EPT Hook installed at PFN 0x%llx (Fake: 0x%llx)\n",
-               hook->OriginalPfn, hook->FakePfn);
+    // 触发当前核心的 VM-Exit，在 VMCALL_TEST 处理器中调用 ept_invept_all()
+    // Intel SDM 保证基于同一个 EPT Pointer 的 INVEPT 可以全局生效，不需要用 DPC 广播死锁所有核心
+    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
+
+    DbgPrintEx(0, 0, "[hv] EPT Hook installed at PFN 0x%llx (Fake: 0x%llx, PID=%p, CR3=0x%llx, page=%p, offset=0x%Ix, size=0x%Ix)\n",
+               hook->OriginalPfn, hook->FakePfn, hook->ProcessId, hook->TargetCr3, hook->TargetPageBase, hook->PatchOffset, hook->PatchSize);
 
     return TRUE;
+}
+
+BOOLEAN
+ept_unhook_process(HANDLE process_id)
+{
+    BOOLEAN found = FALSE;
+
+    if (!g_ept || !process_id)
+        return FALSE;
+
+    for (PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
+         entry != &g_ept->hooked_pages;
+         entry = entry->Flink)
+    {
+        PEPT_HOOK_STATE hook = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
+        if (hook->Enabled && hook->ProcessId == process_id)
+        {
+            DbgPrintEx(0, 0, "[hv] Auto-unhooking exited process PID=%p at PFN 0x%llx\n",
+                     process_id, hook->OriginalPfn);
+            ept_disable_hook(hook);
+            found = TRUE;
+        }
+    }
+
+    if (found)
+    {
+        broadcast_update_ept();
+    }
+
+    return found;
+}
+
+VOID
+ept_cleanup_state(VOID)
+{
+    if (!g_ept)
+        return;
+
+    while (!IsListEmpty(&g_ept->hooked_pages))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&g_ept->hooked_pages);
+        PEPT_HOOK_STATE hook = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
+        ept_release_hook(hook);
+    }
+
+    while (!IsListEmpty(&g_ept->dynamic_splits))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&g_ept->dynamic_splits);
+        PVMM_EPT_DYNAMIC_SPLIT split = CONTAINING_RECORD(entry, VMM_EPT_DYNAMIC_SPLIT, SplitList);
+        ExFreePoolWithTag(split, HV_POOL_TAG);
+    }
 }
 
 VOID
@@ -510,13 +709,11 @@ ept_invept_single(EPT_POINTER ept_ptr)
     asm_invept(InveptSingleContext, &desc);
 }
 
-ULONG_PTR
-ept_invept_all(ULONG_PTR Context)
+VOID
+ept_invept_all(VOID)
 {
-    UNREFERENCED_PARAMETER(Context);
     INVEPT_DESCRIPTOR desc = {0};
     asm_invept(InveptAllContexts, &desc);
-    return 0;
 }
 
 VOID

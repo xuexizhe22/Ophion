@@ -57,7 +57,26 @@ dpc_terminate_guest(
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
 
-    asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+    if (g_vcpu)
+    {
+        ULONG                   core = KeGetCurrentProcessorNumberEx(NULL);
+        VIRTUAL_MACHINE_STATE * vcpu = (core < g_cpu_count) ? &g_vcpu[core] : NULL;
+
+        if (vcpu)
+        {
+            if (vcpu->launched)
+            {
+                asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+            }
+            else if (vcpu->vmx_active)
+            {
+                __vmx_off();
+                __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+                vcpu->vmx_active = FALSE;
+                vcpu->launched = FALSE;
+            }
+        }
+    }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);
@@ -73,4 +92,26 @@ VOID
 broadcast_terminate_all(VOID)
 {
     KeGenericCallDpc(dpc_terminate_guest, NULL);
+}
+
+static VOID
+dpc_update_ept(
+    _In_ PKDPC  Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0); // Trigger a VM-exit to allow hypervisor to process EPT changes and invalidate TLB
+
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+VOID
+broadcast_update_ept(VOID)
+{
+    KeGenericCallDpc(dpc_update_ept, NULL);
 }

@@ -5,6 +5,24 @@
 */
 #include "hv.h"
 
+static volatile LONG g_synthetic_msr_log_budget = 8;
+static volatile LONG g_guest_idle_log_budget = 1;
+static volatile LONG g_crash_msr_log_budget = 4;
+static volatile LONG64 g_hv_crash_msrs[6] = {0};
+
+#ifndef HV_X64_MSR_GUEST_IDLE
+#define HV_X64_MSR_GUEST_IDLE 0x400000F0U
+#endif
+
+#ifndef HV_X64_MSR_CRASH_P0
+#define HV_X64_MSR_CRASH_P0   0x40000100U
+#define HV_X64_MSR_CRASH_P1   0x40000101U
+#define HV_X64_MSR_CRASH_P2   0x40000102U
+#define HV_X64_MSR_CRASH_P3   0x40000103U
+#define HV_X64_MSR_CRASH_P4   0x40000104U
+#define HV_X64_MSR_CRASH_CTL  0x40000105U
+#endif
+
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
 {
@@ -71,6 +89,121 @@ vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
     {
         pending |= bp_matched | PENDING_DEBUG_ENABLED_BP;
         __vmx_vmwrite(VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS, pending);
+    }
+}
+
+static __forceinline BOOLEAN
+vmexit_try_read_msr(UINT32 target_msr, UINT64 *value, NTSTATUS *status)
+{
+    __try
+    {
+        *value = __readmsr(target_msr);
+        if (status)
+            *status = STATUS_SUCCESS;
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (status)
+            *status = GetExceptionCode();
+        return FALSE;
+    }
+}
+
+static __forceinline BOOLEAN
+vmexit_try_write_msr(UINT32 target_msr, UINT64 value, NTSTATUS *status)
+{
+    __try
+    {
+        __writemsr(target_msr, value);
+        if (status)
+            *status = STATUS_SUCCESS;
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (status)
+            *status = GetExceptionCode();
+        return FALSE;
+    }
+}
+
+static __forceinline VOID
+vmexit_log_synthetic_msr(BOOLEAN is_write, UINT32 target_msr, BOOLEAN passed_through, NTSTATUS status)
+{
+    LONG remaining = InterlockedDecrement(&g_synthetic_msr_log_budget);
+    if (remaining < 0)
+        return;
+
+    DbgPrintEx(0, 0,
+             "[hv] %s synthetic MSR 0x%08X -> %s (outer_hv=%d, status=0x%08X)\n",
+             is_write ? "WRMSR" : "RDMSR",
+             target_msr,
+             passed_through ? "pass-through" : "#GP",
+             g_stealth_cpuid_cache.outer_hypervisor_present,
+             (UINT32)status);
+}
+
+static __forceinline VOID
+vmexit_emulate_guest_idle(VIRTUAL_MACHINE_STATE *vcpu)
+{
+    //
+    // HV_X64_MSR_GUEST_IDLE is a side-effecting RDMSR. Reading it from VMX
+    // root would act on the outer hypervisor's VP, not just the nested guest.
+    //
+    // Entering VMCS guest HLT state looked architecturally closer, but under
+    // VMware nested VT-x it can deadlock the nested guest very early in the
+    // idle path. For stability, use a compatibility fallback: retire the
+    // instruction successfully and return zero without descheduling the VP.
+    //
+    // This is not a faithful idle implementation, but it keeps the guest
+    // moving while we stabilize nested-HV behavior.
+    //
+    vcpu->regs->rax = 0;
+    vcpu->regs->rdx = 0;
+
+    if (InterlockedDecrement(&g_guest_idle_log_budget) >= 0)
+    {
+        DbgPrintEx(0, 0, "[hv] RDMSR synthetic MSR 0x%08X -> guest idle compatibility return\n",
+                 HV_X64_MSR_GUEST_IDLE);
+    }
+}
+
+static __forceinline BOOLEAN
+vmexit_is_crash_msr(UINT32 target_msr)
+{
+    return target_msr >= HV_X64_MSR_CRASH_P0 &&
+           target_msr <= HV_X64_MSR_CRASH_CTL;
+}
+
+static __forceinline VOID
+vmexit_handle_crash_msr_read(VIRTUAL_MACHINE_STATE *vcpu, UINT32 target_msr)
+{
+    UINT32 index = target_msr - HV_X64_MSR_CRASH_P0;
+    UINT64 value = (UINT64)g_hv_crash_msrs[index];
+
+    vcpu->regs->rax = (UINT64)(UINT32)value;
+    vcpu->regs->rdx = value >> 32;
+}
+
+static __forceinline VOID
+vmexit_handle_crash_msr_write(UINT32 target_msr, UINT64 value)
+{
+    UINT32 index = target_msr - HV_X64_MSR_CRASH_P0;
+    InterlockedExchange64(&g_hv_crash_msrs[index], (LONG64)value);
+
+    if (target_msr == HV_X64_MSR_CRASH_CTL &&
+        InterlockedDecrement(&g_crash_msr_log_budget) >= 0)
+    {
+        DbgPrintEx(0, 0,
+                 "[hv] Guest crash enlightenment intercepted: "
+                 "P0=0x%llX P1=0x%llX P2=0x%llX P3=0x%llX P4=0x%llX CTL=0x%llX\n",
+                 (UINT64)g_hv_crash_msrs[0],
+                 (UINT64)g_hv_crash_msrs[1],
+                 (UINT64)g_hv_crash_msrs[2],
+                 (UINT64)g_hv_crash_msrs[3],
+                 (UINT64)g_hv_crash_msrs[4],
+                 (UINT64)g_hv_crash_msrs[5]);
     }
 }
 
@@ -214,12 +347,36 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
     PGUEST_REGS regs      = vcpu->regs;
     UINT32      target_msr = (UINT32)(regs->rcx & 0xFFFFFFFF);
 
+    if (target_msr == HV_X64_MSR_GUEST_IDLE)
+    {
+        vmexit_emulate_guest_idle(vcpu);
+        return;
+    }
+
+    if (vmexit_is_crash_msr(target_msr))
+    {
+        vmexit_handle_crash_msr_read(vcpu, target_msr);
+        return;
+    }
+
     //
     // hypervisor synthetic MSRs (0x40000000+) — inject #GP on bare metal
     // this includes Hyper-V (0x40000000-0x400000FF) and KVM (0x4b564d00-02) MSRs
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
     {
+        NTSTATUS status = STATUS_PRIVILEGED_INSTRUCTION;
+
+        if (g_stealth_cpuid_cache.outer_hypervisor_present &&
+            vmexit_try_read_msr(target_msr, &msr.Flags, &status))
+        {
+            vmexit_log_synthetic_msr(FALSE, target_msr, TRUE, status);
+            regs->rax = (UINT64)msr.Fields.Low;
+            regs->rdx = (UINT64)msr.Fields.High;
+            return;
+        }
+
+        vmexit_log_synthetic_msr(FALSE, target_msr, FALSE, status);
         vmexit_inject_gp();
         vcpu->advance_rip = FALSE;
         return;
@@ -307,20 +464,9 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
     }
     else
     {
-        // Many undocumented or OEM MSRs are probed by the Windows kernel (e.g., thermal, power management).
-        // Instead of injecting a fatal #GP into the guest which causes bugchecks,
-        // we attempt to pass through the read using a SEH handler to catch genuinely invalid reads safely.
-        __try
-        {
-            msr.Flags = __readmsr(target_msr);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            // If the actual CPU #GPs on this MSR, then we must reflect that #GP to the guest.
-            vmexit_inject_gp();
-            vcpu->advance_rip = FALSE;
-            return;
-        }
+        vmexit_inject_gp();
+        vcpu->advance_rip = FALSE;
+        return;
     }
 }
 
@@ -334,11 +480,27 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
     msr.Fields.Low  = (ULONG)regs->rax;
     msr.Fields.High = (ULONG)regs->rdx;
 
+    if (vmexit_is_crash_msr(target_msr))
+    {
+        vmexit_handle_crash_msr_write(target_msr, msr.Flags);
+        return;
+    }
+
     //
     // hypervisor synthetic MSRs — inject #GP
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
     {
+        NTSTATUS status = STATUS_PRIVILEGED_INSTRUCTION;
+
+        if (g_stealth_cpuid_cache.outer_hypervisor_present &&
+            vmexit_try_write_msr(target_msr, msr.Flags, &status))
+        {
+            vmexit_log_synthetic_msr(TRUE, target_msr, TRUE, status);
+            return;
+        }
+
+        vmexit_log_synthetic_msr(TRUE, target_msr, FALSE, status);
         vmexit_inject_gp();
         vcpu->advance_rip = FALSE;
         return;
@@ -379,31 +541,15 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
             break;
 
         default:
-            __try
-            {
-                __writemsr(target_msr, msr.Flags);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                vmexit_inject_gp();
-                vcpu->advance_rip = FALSE;
-                return;
-            }
+            __writemsr(target_msr, msr.Flags);
             break;
         }
     }
     else
     {
-        __try
-        {
-            __writemsr(target_msr, msr.Flags);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            vmexit_inject_gp();
-            vcpu->advance_rip = FALSE;
-            return;
-        }
+        vmexit_inject_gp();
+        vcpu->advance_rip = FALSE;
+        return;
     }
 }
 
@@ -645,11 +791,23 @@ VOID
 vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UINT64 guest_phys = 0;
+    UINT64 guest_cr3 = 0;
+    UINT64 guest_linear = 0;
+    PVOID  guest_page_base = NULL;
+
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
+    __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
 
     VMX_EXIT_QUALIFICATION_EPT_VIOLATION qual;
     qual.AsUInt = vcpu->exit_qual;
 
+    if (qual.ValidGuestLinearAddress)
+    {
+        __vmx_vmread(VMCS_GUEST_LINEAR_ADDRESS, &guest_linear);
+        guest_page_base = PAGE_ALIGN((PVOID)(ULONG_PTR)guest_linear);
+    }
+
+    guest_cr3 &= ~0xFFFULL;
     SIZE_T fault_pfn = guest_phys / PAGE_SIZE;
 
     // Search for the hooked page
@@ -659,7 +817,10 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     while (entry != &g_ept->hooked_pages)
     {
         PEPT_HOOK_STATE current = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
-        if (current->OriginalPfn == fault_pfn || current->FakePfn == fault_pfn)
+        if (current->Enabled &&
+            (current->OriginalPfn == fault_pfn || current->FakePfn == fault_pfn) &&
+            (!current->TargetCr3 || current->TargetCr3 == guest_cr3) &&
+            (!current->TargetPageBase || !guest_page_base || current->TargetPageBase == guest_page_base))
         {
             hook = current;
             break;
@@ -713,9 +874,7 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
-    // Unhandled EPT violation.
-    // In our 1:1 identity map, an unhandled violation might be MMIO or other unmapped physical pages.
-    // We'll inject #GP to pass it to the guest.
+    // Unhandled EPT violation (should not happen in identity map unless unmapped)
     vmexit_inject_gp();
     vcpu->advance_rip = FALSE;
 }
@@ -753,6 +912,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     switch (vmcall_num)
     {
     case VMCALL_TEST:
+        ept_invept_all();
         regs->rax = (UINT64)STATUS_SUCCESS;
         break;
 
@@ -774,6 +934,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->vmxoff.guest_cr3 = guest_cr3;
 
         vcpu->vmxoff.executed = TRUE;
+        vcpu->launched = FALSE;
+        vcpu->vmx_active = FALSE;
 
         __vmx_off();
         __writecr3(guest_cr3);
@@ -1116,24 +1278,22 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         {
             PEPT_HOOK_STATE hook = vcpu->mtf_hook_state;
 
-            // We need the physical address. We can just use the fake PFN to get the PML1 entry
-            // since the address mapping is identity mapped.
-            // (The identity map applies to physical addresses, so finding the PML1 for FakePfn * PAGE_SIZE
-            // or OriginalPfn * PAGE_SIZE resolves to the correct entry in the EPT.)
-
-            PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
-            if (pml1)
+            if (hook->Enabled)
             {
-                EPT_PML1_ENTRY new_entry;
-                new_entry.AsUInt = pml1->AsUInt;
-                new_entry.ReadAccess      = 0;
-                new_entry.WriteAccess     = 0;
-                new_entry.ExecuteAccess   = 1;
-                new_entry.PageFrameNumber = hook->FakePfn;
+                PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
+                if (pml1)
+                {
+                    EPT_PML1_ENTRY new_entry;
+                    new_entry.AsUInt = pml1->AsUInt;
+                    new_entry.ReadAccess      = 0;
+                    new_entry.WriteAccess     = 0;
+                    new_entry.ExecuteAccess   = 1;
+                    new_entry.PageFrameNumber = hook->FakePfn;
 
-                InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+                    InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
 
-                ept_invept_single(vcpu->ept_pointer);
+                    ept_invept_single(vcpu->ept_pointer);
+                }
             }
             vcpu->mtf_hook_state = NULL;
         }

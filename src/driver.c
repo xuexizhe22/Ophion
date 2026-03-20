@@ -3,40 +3,8 @@
 *   creates a device object, symbolic link, and initializes vmx
 *   provides ioctl interface for usermode loader communication
 */
+#include <ntifs.h>
 #include "hv.h"
-
-// ==========================================
-// Manually declare Windows Kernel APIs to avoid C2371 redefinition
-// conflicts between ntddk.h and ntifs.h in WDK 10.0.26100.0.
-// ==========================================
-NTKERNELAPI
-NTSTATUS
-PsLookupProcessByProcessId(
-    _In_ HANDLE ProcessId,
-    _Outptr_ PEPROCESS *Process
-    );
-
-typedef struct _KAPC_STATE {
-    LIST_ENTRY ApcListHead[2];
-    struct _KPROCESS *Process;
-    UCHAR KernelApcInProgress;
-    UCHAR KernelApcPending;
-    UCHAR UserApcPending;
-} KAPC_STATE, *PKAPC_STATE, *PRKAPC_STATE;
-
-NTKERNELAPI
-VOID
-KeStackAttachProcess (
-    _Inout_ PRKPROCESS PROCESS,
-    _Out_ PRKAPC_STATE ApcState
-    );
-
-NTKERNELAPI
-VOID
-KeUnstackDetachProcess (
-    _In_ PRKAPC_STATE ApcState
-    );
-// ==========================================
 
 #define DEVICE_NAME     L"\\Device\\Ophion"
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
@@ -52,8 +20,31 @@ typedef struct _EPT_HOOK_REQUEST {
     UINT32 PatchSize;
 } EPT_HOOK_REQUEST, *PEPT_HOOK_REQUEST;
 
+typedef struct _EPT_HOOK_REQUEST32 {
+    UINT32 ProcessId;
+    UINT32 VirtualAddress;
+    UCHAR  PatchBytes[16];
+    UINT32 PatchSize;
+} EPT_HOOK_REQUEST32, *PEPT_HOOK_REQUEST32;
+
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
+static NTSTATUS DriverHandleEptHook(_In_ PEPT_HOOK_REQUEST req);
+static VOID DriverProcessNotifyEx(_Inout_ PEPROCESS process, _In_ HANDLE process_id, _Inout_opt_ PPS_CREATE_NOTIFY_INFO create_info);
+
+static VOID
+DriverProcessNotifyEx(
+    _Inout_ PEPROCESS process,
+    _In_ HANDLE process_id,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO create_info)
+{
+    UNREFERENCED_PARAMETER(process);
+
+    if (create_info == NULL)
+    {
+        ept_unhook_process(process_id);
+    }
+}
 
 VOID
 DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
@@ -61,6 +52,8 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     UNICODE_STRING symlink;
 
     DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
+
+    PsSetCreateProcessNotifyRoutineEx(DriverProcessNotifyEx, TRUE);
 
     broadcast_terminate_all();
     vmx_terminate();
@@ -124,10 +117,22 @@ DriverEntry(
     if (!vmx_init())
     {
         DbgPrintEx(0, 0, "[hv] VMX initialization FAILED!\n");
-        vmx_terminate();  // clean up any partially-allocated resources
+        broadcast_terminate_all();
+        vmx_terminate();
         IoDeleteSymbolicLink(&symlink);
         IoDeleteDevice(device_obj);
         return STATUS_HV_OPERATION_FAILED;
+    }
+
+    status = PsSetCreateProcessNotifyRoutineEx(DriverProcessNotifyEx, FALSE);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(0, 0, "[hv] PsSetCreateProcessNotifyRoutineEx(register) failed: 0x%X\n", status);
+        broadcast_terminate_all();
+        vmx_terminate();
+        IoDeleteSymbolicLink(&symlink);
+        IoDeleteDevice(device_obj);
+        return status;
     }
 
     DbgPrintEx(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
@@ -148,6 +153,125 @@ DriverCreateClose(
 }
 
 static NTSTATUS
+DriverHandleEptHook(
+    _In_ PEPT_HOOK_REQUEST req)
+{
+    NTSTATUS    status;
+    PEPROCESS   target_process = NULL;
+    KAPC_STATE  apc_state;
+    PVOID       page_base;
+    SIZE_T      page_offset;
+    UINT64      target_cr3 = 0;
+    PMDL        locked_mdl = NULL;
+    BOOLEAN     pages_locked = FALSE;
+    PVOID       source_page = NULL;
+    PPFN_NUMBER pfns = NULL;
+    SIZE_T      phys_addr = 0;
+
+    if (!req->VirtualAddress)
+    {
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    if (req->PatchSize == 0 || req->PatchSize > sizeof(req->PatchBytes))
+    {
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+
+    page_offset = BYTE_OFFSET(req->VirtualAddress);
+    if ((PAGE_SIZE - page_offset) < req->PatchSize)
+    {
+        DbgPrintEx(0, 0, "[hv] IOCTL_HV_EPT_HOOK rejected cross-page patch (offset=0x%Ix size=0x%X)\n",
+                 page_offset, req->PatchSize);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req->ProcessId, &target_process);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    page_base = PAGE_ALIGN(req->VirtualAddress);
+
+    KeStackAttachProcess(target_process, &apc_state);
+    target_cr3 = __readcr3() & ~0xFFFULL;
+
+    locked_mdl = IoAllocateMdl(page_base, PAGE_SIZE, FALSE, FALSE, NULL);
+    if (!locked_mdl)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    __try
+    {
+        MmProbeAndLockPages(locked_mdl, UserMode, IoReadAccess);
+        pages_locked = TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        status = GetExceptionCode();
+        DbgPrintEx(0, 0, "[hv] MmProbeAndLockPages failed for %p: 0x%X\n",
+                 req->VirtualAddress, status);
+        goto Exit;
+    }
+
+    source_page = MmGetSystemAddressForMdlSafe(
+        locked_mdl,
+        HighPagePriority | MdlMappingNoExecute);
+    if (!source_page)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
+    pfns = MmGetMdlPfnArray(locked_mdl);
+    if (!pfns)
+    {
+        status = STATUS_UNSUCCESSFUL;
+        goto Exit;
+    }
+
+    phys_addr = ((SIZE_T)pfns[0] * PAGE_SIZE) + page_offset;
+
+    if (!ept_hook_page(
+            phys_addr,
+            source_page,
+            page_base,
+            target_cr3,
+            page_offset,
+            req->PatchBytes,
+            req->PatchSize,
+            locked_mdl,
+            PsGetProcessId(target_process)))
+    {
+        status = STATUS_UNSUCCESSFUL;
+        goto Exit;
+    }
+
+    locked_mdl = NULL;
+    pages_locked = FALSE;
+    status = STATUS_SUCCESS;
+
+Exit:
+    KeUnstackDetachProcess(&apc_state);
+
+    if (pages_locked)
+    {
+        MmUnlockPages(locked_mdl);
+    }
+
+    if (locked_mdl)
+    {
+        IoFreeMdl(locked_mdl);
+    }
+
+    ObDereferenceObject(target_process);
+    return status;
+}
+
+static NTSTATUS
 DriverIoControl(
     _In_ PDEVICE_OBJECT device_obj,
     _In_ PIRP           irp)
@@ -160,6 +284,7 @@ DriverIoControl(
 
     io_stack       = IoGetCurrentIrpStackLocation(irp);
     ioctl_code = io_stack->Parameters.DeviceIoControl.IoControlCode;
+    irp->IoStatus.Information = 0;
 
     switch (ioctl_code)
     {
@@ -182,88 +307,32 @@ DriverIoControl(
 
     case IOCTL_HV_EPT_HOOK:
     {
-        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(EPT_HOOK_REQUEST))
+        ULONG input_len = io_stack->Parameters.DeviceIoControl.InputBufferLength;
+
+        if (input_len >= sizeof(EPT_HOOK_REQUEST))
         {
             PEPT_HOOK_REQUEST req = (PEPT_HOOK_REQUEST)irp->AssociatedIrp.SystemBuffer;
-            PEPROCESS target_process = NULL;
+            status = DriverHandleEptHook(req);
+        }
+        else if (input_len >= sizeof(EPT_HOOK_REQUEST32))
+        {
+            PEPT_HOOK_REQUEST32 req32 = (PEPT_HOOK_REQUEST32)irp->AssociatedIrp.SystemBuffer;
+            EPT_HOOK_REQUEST req = { 0 };
 
-            // Validate that the patch won't overflow a page boundary
-            SIZE_T offset = (SIZE_T)req->VirtualAddress & (PAGE_SIZE - 1);
-            if (offset + req->PatchSize > PAGE_SIZE || req->PatchSize > sizeof(req->PatchBytes))
-            {
-                status = STATUS_INVALID_PARAMETER;
-                break;
-            }
+            req.ProcessId      = req32->ProcessId;
+            req.VirtualAddress = (PVOID)(ULONG_PTR)req32->VirtualAddress;
+            RtlCopyMemory(req.PatchBytes, req32->PatchBytes, sizeof(req.PatchBytes));
+            req.PatchSize      = req32->PatchSize;
 
-            status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req->ProcessId, &target_process);
-            if (NT_SUCCESS(status))
-            {
-                KAPC_STATE apc_state;
-                KeStackAttachProcess(target_process, &apc_state);
+            DbgPrintEx(0, 0, "[hv] IOCTL_HV_EPT_HOOK: accepted 32-bit request (pid=%u, va=%p, inlen=%lu)\n",
+                     req.ProcessId, req.VirtualAddress, input_len);
 
-                // Lock the ENTIRE PAGE in memory so it isn't paged out while being hooked and copied.
-                // Locking only PatchSize would allow the rest of the page to be paged out, causing BSODs.
-                PVOID page_va = (PVOID)((ULONG_PTR)req->VirtualAddress & ~(PAGE_SIZE - 1));
-                PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
-                if (mdl)
-                {
-                    __try
-                    {
-                        MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
-
-                        PVOID system_va = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
-                        if (system_va)
-                        {
-                            PHYSICAL_ADDRESS phys_addr = MmGetPhysicalAddress(system_va);
-
-                            if (phys_addr.QuadPart != 0)
-                            {
-                                // Calculate the offset within the page
-                                SIZE_T offset = (ULONG_PTR)req->VirtualAddress & (PAGE_SIZE - 1);
-                                PVOID target_system_va = (PVOID)((ULONG_PTR)system_va + offset);
-
-                                if (ept_hook_page(target_system_va, phys_addr.QuadPart, req->PatchBytes, req->PatchSize))
-                                {
-                                    status = STATUS_SUCCESS;
-                                }
-                                else
-                                {
-                                    MmUnlockPages(mdl);
-                                    IoFreeMdl(mdl);
-                                    status = STATUS_UNSUCCESSFUL;
-                                }
-                            }
-                            else
-                            {
-                                MmUnlockPages(mdl);
-                                IoFreeMdl(mdl);
-                                status = STATUS_INVALID_ADDRESS;
-                            }
-                        }
-                        else
-                        {
-                            MmUnlockPages(mdl);
-                            IoFreeMdl(mdl);
-                            status = STATUS_INSUFFICIENT_RESOURCES;
-                        }
-                    }
-                    __except (EXCEPTION_EXECUTE_HANDLER)
-                    {
-                        IoFreeMdl(mdl);
-                        status = GetExceptionCode();
-                    }
-                }
-                else
-                {
-                    status = STATUS_INSUFFICIENT_RESOURCES;
-                }
-
-                KeUnstackDetachProcess(&apc_state);
-                ObDereferenceObject(target_process);
-            }
+            status = DriverHandleEptHook(&req);
         }
         else
         {
+            DbgPrintEx(0, 0, "[hv] IOCTL_HV_EPT_HOOK: input buffer too small (got=%lu, need=%Iu or %Iu)\n",
+                     input_len, sizeof(EPT_HOOK_REQUEST), sizeof(EPT_HOOK_REQUEST32));
             status = STATUS_BUFFER_TOO_SMALL;
         }
         break;
