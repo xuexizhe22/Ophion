@@ -1192,7 +1192,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             //   cpuid_entry_tsc + bare_metal_cost < tsc (real time is always ahead)
             //   so compensated < real TSC  (future native RDTSCs are safe)
             //
-            tsc = vcpu->tsc_cpuid_entry
+            tsc = vcpu->tsc_cpuid_entry - 200
                 + g_stealth_cpuid_cache.bare_metal_cpuid_cost
                 + (UINT64)(INT64)offset_raw;
 
@@ -1518,7 +1518,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 #if STEALTH_COMPENSATE_TIMING
         if (vcpu->tsc_rdtsc_armed)
         {
-            tsc = vcpu->tsc_cpuid_entry
+            tsc = vcpu->tsc_cpuid_entry - 200
                 + g_stealth_cpuid_cache.bare_metal_cpuid_cost
                 + (UINT64)(INT64)offset_raw;
 
