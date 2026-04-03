@@ -875,6 +875,7 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
 
                 vcpu->mtf_hook_state = hook;
+                vcpu->mtf_write_occurred = (BOOLEAN)qual.WriteAccess;
             }
             else if (qual.ExecuteAccess)
             {
