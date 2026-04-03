@@ -679,9 +679,6 @@ ept_hook_page(
     hook->LockedMdl = locked_mdl;
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
 
-    // Trigger a VM-exit on the current CPU so INVEPT can make the new mapping visible.
-    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
-
     // 触发当前核心的 VM-Exit，在 VMCALL_TEST 处理器中调用 ept_invept_all()
     // Intel SDM 保证基于同一个 EPT Pointer 的 INVEPT 可以全局生效，不需要用 DPC 广播死锁所有核心
     asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
