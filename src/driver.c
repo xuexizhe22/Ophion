@@ -27,22 +27,112 @@ typedef struct _EPT_HOOK_REQUEST32 {
     UINT32 PatchSize;
 } EPT_HOOK_REQUEST32, *PEPT_HOOK_REQUEST32;
 
+static HANDLE g_hook_guard_thread = NULL;
+static KEVENT g_hook_guard_stop_event;
+
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverHandleEptHook(_In_ PEPT_HOOK_REQUEST req);
-static VOID DriverProcessNotifyEx(_Inout_ PEPROCESS process, _In_ HANDLE process_id, _Inout_opt_ PPS_CREATE_NOTIFY_INFO create_info);
+static NTSTATUS DriverPreflightCheck(VOID);
+static VOID DriverScanExitedHooks(VOID);
+static VOID DriverHookGuardThread(_In_ PVOID start_context);
+
+static BOOLEAN
+DriverHypervisorVendorEquals(_In_reads_(12) const CHAR * vendor)
+{
+    return RtlCompareMemory(
+        &g_stealth_cpuid_cache.hypervisor_vendor[0],
+        vendor,
+        12) == 12;
+}
+
+static NTSTATUS
+DriverPreflightCheck(VOID)
+{
+    if (!vmx_check_support())
+    {
+        DbgPrintEx(0, 0, "[hv] Preflight failed: VMX not supported or disabled by firmware\n");
+        return STATUS_HV_FEATURE_UNAVAILABLE;
+    }
+
+#if STEALTH_CPUID_CACHING
+    stealth_init_cpuid_cache();
+
+    if (g_stealth_cpuid_cache.outer_hypervisor_present)
+    {
+        if (DriverHypervisorVendorEquals("VMwareVMware"))
+        {
+            DbgPrintEx(0, 0, "[hv] Preflight: VMware outer hypervisor detected, nested compatibility path allowed\n");
+            return STATUS_SUCCESS;
+        }
+
+        DbgPrintEx(0, 0, "[hv] Preflight blocked: outer hypervisor %.4s%.4s%.4s is not in the allow-list\n",
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[0],
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[1],
+                 (const CHAR *)&g_stealth_cpuid_cache.hypervisor_vendor[2]);
+        return STATUS_HV_FEATURE_UNAVAILABLE;
+    }
+#endif
+
+    return STATUS_SUCCESS;
+}
 
 static VOID
-DriverProcessNotifyEx(
-    _Inout_ PEPROCESS process,
-    _In_ HANDLE process_id,
-    _Inout_opt_ PPS_CREATE_NOTIFY_INFO create_info)
+DriverScanExitedHooks(VOID)
 {
-    UNREFERENCED_PARAMETER(process);
+    BOOLEAN updated = FALSE;
 
-    if (create_info == NULL)
+    if (!g_ept)
+        return;
+
+    for (PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
+         entry != &g_ept->hooked_pages;
+         entry = entry->Flink)
     {
-        ept_unhook_process(process_id);
+        PEPT_HOOK_STATE hook = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
+
+        if (!hook->Enabled || !hook->ProcessObject)
+            continue;
+
+        if (PsGetProcessExitStatus(hook->ProcessObject) != STATUS_PENDING)
+        {
+            DbgPrintEx(0, 0, "[hv] Auto-disabling EPT hook for exited process PID=%p\n", hook->ProcessId);
+            ept_disable_hook(hook);
+            updated = TRUE;
+        }
+    }
+
+    if (updated && g_vcpu)
+    {
+        broadcast_update_ept();
+    }
+}
+
+static VOID
+DriverHookGuardThread(_In_ PVOID start_context)
+{
+    LARGE_INTEGER interval;
+    NTSTATUS wait_status;
+
+    UNREFERENCED_PARAMETER(start_context);
+
+    interval.QuadPart = -10 * 1000 * 1000;
+
+    for (;;)
+    {
+        wait_status = KeWaitForSingleObject(
+            &g_hook_guard_stop_event,
+            Executive,
+            KernelMode,
+            FALSE,
+            &interval);
+
+        if (wait_status == STATUS_SUCCESS)
+        {
+            PsTerminateSystemThread(STATUS_SUCCESS);
+        }
+
+        DriverScanExitedHooks();
     }
 }
 
@@ -53,7 +143,13 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 
     DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
 
-    PsSetCreateProcessNotifyRoutineEx(DriverProcessNotifyEx, TRUE);
+    if (g_hook_guard_thread)
+    {
+        KeSetEvent(&g_hook_guard_stop_event, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(g_hook_guard_thread, FALSE, NULL);
+        ZwClose(g_hook_guard_thread);
+        g_hook_guard_thread = NULL;
+    }
 
     broadcast_terminate_all();
     vmx_terminate();
@@ -81,7 +177,14 @@ DriverEntry(
 
     UNREFERENCED_PARAMETER(registry_path);
 
-    DbgPrintEx(0, 0, "[hv] DriverEntry — Hypervisor initializing...\n");
+    DbgPrintEx(0, 0, "[hv] DriverEntry - Hypervisor initializing...\n");
+
+    status = DriverPreflightCheck();
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrintEx(0, 0, "[hv] Driver preflight failed: 0x%X\n", status);
+        return status;
+    }
 
     RtlInitUnicodeString(&device_name, DEVICE_NAME);
     status = IoCreateDevice(
@@ -124,10 +227,18 @@ DriverEntry(
         return STATUS_HV_OPERATION_FAILED;
     }
 
-    status = PsSetCreateProcessNotifyRoutineEx(DriverProcessNotifyEx, FALSE);
+    KeInitializeEvent(&g_hook_guard_stop_event, NotificationEvent, FALSE);
+    status = PsCreateSystemThread(
+        &g_hook_guard_thread,
+        THREAD_ALL_ACCESS,
+        NULL,
+        NULL,
+        NULL,
+        DriverHookGuardThread,
+        NULL);
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(0, 0, "[hv] PsSetCreateProcessNotifyRoutineEx(register) failed: 0x%X\n", status);
+        DbgPrintEx(0, 0, "[hv] Failed to start hook guard thread: 0x%X\n", status);
         broadcast_terminate_all();
         vmx_terminate();
         IoDeleteSymbolicLink(&symlink);
@@ -244,7 +355,8 @@ DriverHandleEptHook(
             req->PatchBytes,
             req->PatchSize,
             locked_mdl,
-            PsGetProcessId(target_process)))
+            PsGetProcessId(target_process),
+            target_process))
     {
         status = STATUS_UNSUCCESSFUL;
         goto Exit;
@@ -282,7 +394,7 @@ DriverIoControl(
 
     UNREFERENCED_PARAMETER(device_obj);
 
-    io_stack       = IoGetCurrentIrpStackLocation(irp);
+    io_stack = IoGetCurrentIrpStackLocation(irp);
     ioctl_code = io_stack->Parameters.DeviceIoControl.IoControlCode;
     irp->IoStatus.Information = 0;
 
@@ -290,9 +402,6 @@ DriverIoControl(
     {
     case IOCTL_HV_STATUS:
     {
-        //
-        // return basic status: number of virtualized cores
-        //
         if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(UINT32))
         {
             *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
@@ -339,9 +448,6 @@ DriverIoControl(
     }
 
     default:
-        //
-        // add more shi here later
-        //
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }

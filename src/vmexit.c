@@ -813,16 +813,18 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     // Search for the hooked page
     PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
     PEPT_HOOK_STATE hook = NULL;
+    BOOLEAN hook_matches_context = FALSE;
 
     while (entry != &g_ept->hooked_pages)
     {
         PEPT_HOOK_STATE current = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
-        if (current->Enabled &&
-            (current->OriginalPfn == fault_pfn || current->FakePfn == fault_pfn) &&
-            (!current->TargetCr3 || current->TargetCr3 == guest_cr3) &&
-            (!current->TargetPageBase || !guest_page_base || current->TargetPageBase == guest_page_base))
+        if (current->OriginalPfn == fault_pfn || current->FakePfn == fault_pfn)
         {
             hook = current;
+            hook_matches_context =
+                current->Enabled &&
+                (!current->TargetCr3 || current->TargetCr3 == guest_cr3) &&
+                (!current->TargetPageBase || !guest_page_base || current->TargetPageBase == guest_page_base);
             break;
         }
         entry = entry->Flink;
@@ -830,13 +832,34 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
 
     if (hook)
     {
-        PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, guest_phys);
+        PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
         if (pml1)
         {
             EPT_PML1_ENTRY new_entry;
+            size_t cpu_controls = 0;
             new_entry.AsUInt = pml1->AsUInt;
 
-            if (qual.ReadAccess || qual.WriteAccess)
+            if (!hook->Enabled)
+            {
+                new_entry.ReadAccess      = 1;
+                new_entry.WriteAccess     = 1;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->OriginalPfn;
+            }
+            else if (!hook_matches_context)
+            {
+                new_entry.ReadAccess      = 1;
+                new_entry.WriteAccess     = 1;
+                new_entry.ExecuteAccess   = 1;
+                new_entry.PageFrameNumber = hook->OriginalPfn;
+
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
+                cpu_controls |= (size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
+
+                vcpu->mtf_hook_state = hook;
+            }
+            else if (qual.ReadAccess || qual.WriteAccess)
             {
                 // Guest is trying to read/write the execute-only page.
                 // Swap back to original PFN with Read/Write access (Execute disabled).
@@ -846,7 +869,6 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
                 new_entry.PageFrameNumber = hook->OriginalPfn;
 
                 // Set MTF to catch the instruction after it executes, so we can restore the hook.
-                size_t cpu_controls = 0;
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
                 cpu_controls |= (size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
@@ -1192,7 +1214,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             //   cpuid_entry_tsc + bare_metal_cost < tsc (real time is always ahead)
             //   so compensated < real TSC  (future native RDTSCs are safe)
             //
-            tsc = vcpu->tsc_cpuid_entry - 200
+            tsc = vcpu->tsc_cpuid_entry
                 + g_stealth_cpuid_cache.bare_metal_cpuid_cost
                 + (UINT64)(INT64)offset_raw;
 
@@ -1277,7 +1299,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         if (vcpu->mtf_hook_state)
         {
             PEPT_HOOK_STATE hook = vcpu->mtf_hook_state;
-
             if (hook->Enabled)
             {
                 PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
@@ -1518,7 +1539,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 #if STEALTH_COMPENSATE_TIMING
         if (vcpu->tsc_rdtsc_armed)
         {
-            tsc = vcpu->tsc_cpuid_entry - 200
+            tsc = vcpu->tsc_cpuid_entry
                 + g_stealth_cpuid_cache.bare_metal_cpuid_cost
                 + (UINT64)(INT64)offset_raw;
 

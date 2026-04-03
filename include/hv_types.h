@@ -79,6 +79,7 @@ typedef struct _EPT_HOOK_STATE {
     PVOID      TargetPageBase;
     PVOID      OriginalPageVa;
     PVOID      FakeVa;
+    PEPROCESS  ProcessObject;
     PMDL       LockedMdl;
     HANDLE     ProcessId;
     SIZE_T     PatchOffset;

@@ -53,7 +53,6 @@ BOOLEAN ept_check_features(VOID);
 BOOLEAN ept_build_mtrr_map(VOID);
 BOOLEAN ept_init(VOID);
 VOID    ept_cleanup_state(VOID);
-BOOLEAN ept_unhook_process(HANDLE process_id);
 PVMM_EPT_PAGE_TABLE ept_alloc_identity_map(VOID);
 UINT8   ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page);
 BOOLEAN ept_valid_for_large_page(SIZE_T pfn);
@@ -72,7 +71,9 @@ BOOLEAN ept_hook_page(
     PVOID patch_bytes,
     SIZE_T patch_size,
     PMDL locked_mdl,
-    HANDLE process_id);
+    HANDLE process_id,
+    PEPROCESS target_process);
+VOID    ept_disable_hook(PEPT_HOOK_STATE hook);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 VOID ept_invept_all(VOID);

@@ -6,8 +6,6 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Ophion", "Ophion.vcxproj", 
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ConsoleApplication1", "..\ConsoleApplication1\ConsoleApplication1.vcxproj", "{936843EA-7732-4E4E-A5CF-27BE07D7A052}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ConsoleApplication2", "..\ConsoleApplication2\ConsoleApplication2.vcxproj", "{4B82FC59-6A38-4648-BC4E-7C1F98562D87}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -22,15 +20,8 @@ Global
 		{936843EA-7732-4E4E-A5CF-27BE07D7A052}.Debug|x64.Build.0 = Debug|x64
 		{936843EA-7732-4E4E-A5CF-27BE07D7A052}.Release|x64.ActiveCfg = Release|x64
 		{936843EA-7732-4E4E-A5CF-27BE07D7A052}.Release|x64.Build.0 = Release|x64
-		{4B82FC59-6A38-4648-BC4E-7C1F98562D87}.Debug|x64.ActiveCfg = Debug|x64
-		{4B82FC59-6A38-4648-BC4E-7C1F98562D87}.Debug|x64.Build.0 = Debug|x64
-		{4B82FC59-6A38-4648-BC4E-7C1F98562D87}.Release|x64.ActiveCfg = Release|x64
-		{4B82FC59-6A38-4648-BC4E-7C1F98562D87}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
-	EndGlobalSection
-	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {718FD319-05AD-436B-A94F-BC71E7F79486}
 	EndGlobalSection
 EndGlobal

@@ -57,6 +57,11 @@ ept_release_hook(_In_ PEPT_HOOK_STATE hook)
         IoFreeMdl(hook->LockedMdl);
     }
 
+    if (hook->ProcessObject)
+    {
+        ObDereferenceObject(hook->ProcessObject);
+    }
+
     if (hook->FakeVa)
     {
         MmFreeContiguousMemory(hook->FakeVa);
@@ -65,38 +70,37 @@ ept_release_hook(_In_ PEPT_HOOK_STATE hook)
     ExFreePoolWithTag(hook, HV_POOL_TAG);
 }
 
-static VOID
+VOID
 ept_disable_hook(_In_ PEPT_HOOK_STATE hook)
 {
     if (!hook || !hook->Enabled)
         return;
-
-    hook->Enabled = FALSE;
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {
         PVMM_EPT_PAGE_TABLE page_table = g_vcpu[i].ept_page_table;
         PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, hook->OriginalPfn * PAGE_SIZE);
 
+        if (pml1)
+        {
+            EPT_PML1_ENTRY new_entry;
+            new_entry.AsUInt = pml1->AsUInt;
+            new_entry.ReadAccess      = 1;
+            new_entry.WriteAccess     = 1;
+            new_entry.ExecuteAccess   = 1;
+            new_entry.PageFrameNumber = hook->OriginalPfn;
+
+            InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+        }
+
         if (g_vcpu[i].mtf_hook_state == hook)
         {
             g_vcpu[i].mtf_hook_state = NULL;
         }
-
-        if (!pml1)
-            continue;
-
-        EPT_PML1_ENTRY new_entry;
-        new_entry.AsUInt = pml1->AsUInt;
-        new_entry.ReadAccess      = 1;
-        new_entry.WriteAccess     = 1;
-        new_entry.ExecuteAccess   = 1;
-        new_entry.PageFrameNumber = hook->OriginalPfn;
-
-        InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
     }
 
-    hook->TargetCr3 = 0;
+    hook->Enabled        = FALSE;
+    hook->TargetCr3      = 0;
     hook->TargetPageBase = NULL;
 }
 
@@ -527,7 +531,8 @@ ept_hook_page(
     PVOID patch_bytes,
     SIZE_T patch_size,
     PMDL locked_mdl,
-    HANDLE process_id)
+    HANDLE process_id,
+    PEPROCESS target_process)
 {
     SIZE_T target_pfn = phys_addr / PAGE_SIZE;
 
@@ -549,7 +554,6 @@ ept_hook_page(
             IoFreeMdl(existing_hook->LockedMdl);
         }
 
-        existing_hook->Enabled        = TRUE;
         existing_hook->OriginalPageVa = source_page_va;
         existing_hook->TargetPageBase = target_page_base;
         existing_hook->TargetCr3      = target_cr3 & ~0xFFFULL;
@@ -557,6 +561,37 @@ ept_hook_page(
         existing_hook->ProcessId      = process_id;
         existing_hook->PatchOffset    = patch_offset;
         existing_hook->PatchSize      = patch_size;
+        existing_hook->Enabled        = TRUE;
+
+        if (existing_hook->ProcessObject != target_process)
+        {
+            if (target_process)
+                ObReferenceObject(target_process);
+
+            if (existing_hook->ProcessObject)
+                ObDereferenceObject(existing_hook->ProcessObject);
+
+            existing_hook->ProcessObject = target_process;
+        }
+
+        for (UINT32 i = 0; i < g_cpu_count; i++)
+        {
+            PVMM_EPT_PAGE_TABLE page_table = g_vcpu[i].ept_page_table;
+            PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, target_pfn * PAGE_SIZE);
+
+            if (!pml1)
+            {
+                DbgPrintEx(0, 0, "[hv] EPT Hook refresh failed: PML1 lookup failed on CPU %u for PFN 0x%llx\n",
+                         i, target_pfn);
+                existing_hook->Enabled = FALSE;
+                return FALSE;
+            }
+
+            pml1->ReadAccess      = 0;
+            pml1->WriteAccess     = 0;
+            pml1->ExecuteAccess   = 1;
+            pml1->PageFrameNumber = existing_hook->FakePfn;
+        }
 
         // Make sure every CPU sees the refreshed fake page contents.
         asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
@@ -588,14 +623,21 @@ ept_hook_page(
 
     hook->OriginalPfn = target_pfn;
     hook->FakePfn     = va_to_pa(fake_page) / PAGE_SIZE;
-    hook->Enabled     = TRUE;
     hook->TargetCr3   = target_cr3 & ~0xFFFULL;
     hook->TargetPageBase = target_page_base;
     hook->OriginalPageVa = source_page_va;
     hook->FakeVa      = fake_page;
+    hook->ProcessObject = NULL;
     hook->ProcessId   = process_id;
     hook->PatchOffset = patch_offset;
     hook->PatchSize   = patch_size;
+    hook->Enabled     = TRUE;
+
+    if (target_process)
+    {
+        ObReferenceObject(target_process);
+        hook->ProcessObject = target_process;
+    }
 
     // Split large page and update PML1 across all cores
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -632,7 +674,7 @@ ept_hook_page(
         }
     }
 
-
+   
 
     hook->LockedMdl = locked_mdl;
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
@@ -648,36 +690,6 @@ ept_hook_page(
                hook->OriginalPfn, hook->FakePfn, hook->ProcessId, hook->TargetCr3, hook->TargetPageBase, hook->PatchOffset, hook->PatchSize);
 
     return TRUE;
-}
-
-BOOLEAN
-ept_unhook_process(HANDLE process_id)
-{
-    BOOLEAN found = FALSE;
-
-    if (!g_ept || !process_id)
-        return FALSE;
-
-    for (PLIST_ENTRY entry = g_ept->hooked_pages.Flink;
-         entry != &g_ept->hooked_pages;
-         entry = entry->Flink)
-    {
-        PEPT_HOOK_STATE hook = CONTAINING_RECORD(entry, EPT_HOOK_STATE, ListEntry);
-        if (hook->Enabled && hook->ProcessId == process_id)
-        {
-            DbgPrintEx(0, 0, "[hv] Auto-unhooking exited process PID=%p at PFN 0x%llx\n",
-                     process_id, hook->OriginalPfn);
-            ept_disable_hook(hook);
-            found = TRUE;
-        }
-    }
-
-    if (found)
-    {
-        broadcast_update_ept();
-    }
-
-    return found;
 }
 
 VOID

@@ -15,6 +15,9 @@ stealth_init_cpuid_cache(VOID)
 {
     INT32 cpu_info[4] = {0};
 
+    if (g_stealth_cpuid_cache.initialized)
+        return;
+
     __cpuidex(cpu_info, 1, 0);
     g_stealth_cpuid_cache.outer_hypervisor_present =
         !!((UINT32)cpu_info[2] & (1U << 31));
@@ -41,7 +44,7 @@ stealth_init_cpuid_cache(VOID)
     // Disable stealth paths that would make CPUID/MSR behavior inconsistent.
     //
     if (g_stealth_cpuid_cache.outer_hypervisor_present)
-        g_stealth_enabled = TRUE; // FORCED ON FOR RDTSC TIMING MITIGATION
+        g_stealth_enabled = FALSE;
 
     //
     // cache the response for an obviously invalid leaf.
