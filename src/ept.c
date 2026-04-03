@@ -674,7 +674,7 @@ ept_hook_page(
         }
     }
 
-   
+
 
     hook->LockedMdl = locked_mdl;
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);

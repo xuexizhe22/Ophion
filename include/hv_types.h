@@ -163,6 +163,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 
     // EPT Hook MTF tracking
     PEPT_HOOK_STATE mtf_hook_state;
+    BOOLEAN         mtf_write_occurred;
 
     // guest DR0-DR3/DR6 saved on vm-exit, restored before vmresume
     UINT64  guest_dr0;

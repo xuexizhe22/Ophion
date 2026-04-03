@@ -858,6 +858,7 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
 
                 vcpu->mtf_hook_state = hook;
+                vcpu->mtf_write_occurred = (BOOLEAN)qual.WriteAccess;
             }
             else if (qual.ReadAccess || qual.WriteAccess)
             {
@@ -1301,6 +1302,33 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             PEPT_HOOK_STATE hook = vcpu->mtf_hook_state;
             if (hook->Enabled)
             {
+                // SMC Synchronization Logic:
+                // If the MTF was triggered by a Write access to the hook page,
+                // the Original page now contains new self-modified code or data.
+                // We must sync the Fake page to match, and then re-apply our Hook payload.
+                if (vcpu->mtf_write_occurred)
+                {
+                    // We must use the mapped and locked system virtual addresses.
+                    // Directly accessing physical memory in VMX root will cause a #PF and a fatal BSOD.
+                    PVOID original_page_ptr = hook->OriginalPageVa;
+                    PVOID fake_page_ptr = hook->FakeVa;
+
+                    // 1. Copy newly modified page from Original to Fake
+                    RtlCopyMemory(fake_page_ptr, original_page_ptr, PAGE_SIZE);
+
+                    // 2. Re-apply our custom hook payload so it isn't erased
+                    if (hook->PatchSize > 0)
+                    {
+                        RtlCopyMemory(
+                            (PUCHAR)fake_page_ptr + hook->PatchOffset,
+                            hook->PatchBytes,
+                            hook->PatchSize
+                        );
+                    }
+
+                    vcpu->mtf_write_occurred = FALSE;
+                }
+
                 PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, hook->OriginalPfn * PAGE_SIZE);
                 if (pml1)
                 {
