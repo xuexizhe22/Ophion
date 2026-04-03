@@ -863,6 +863,46 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
             else if (qual.ReadAccess || qual.WriteAccess)
             {
                 // Guest is trying to read/write the execute-only page.
+
+                // === DBVM-Style Micro-Emulator Fast-Path (The Ultimate Ping-Pong Killer) ===
+                // We specifically target the instruction: FF 24 85 <imm32> (jmp dword ptr [eax*4+imm32])
+                // This is a 32-bit jump table read that causes massive ping-pong in war3.exe
+                if (qual.ReadAccess && !qual.WriteAccess && hook->Enabled)
+                {
+                    UINT64 guest_rip = 0;
+                    __vmx_vmread(VMCS_GUEST_RIP, &guest_rip);
+
+                    // We only emulate if the executing instruction is also on this exact fake page
+                    UINT64 page_base_va = guest_rip & ~0xFFFULL;
+                    if (page_base_va == (UINT64)hook->OriginalPageVa ||
+                        (hook->TargetPageBase && page_base_va == (UINT64)hook->TargetPageBase))
+                    {
+                        // Safely read the instruction bytes from our locked kernel mapping (FakeVa)
+                        PUCHAR inst = (PUCHAR)hook->FakeVa + (guest_rip & 0xFFF);
+
+                        // Check for JMP DWORD PTR [reg*4+imm32] (FF 24 XX)
+                        if ((guest_rip & 0xFFF) <= (PAGE_SIZE - 2) && inst[0] == 0xFF && inst[1] == 0x24)
+                        {
+                            // We are reading from a jump table!
+                            // We already know the EXACT physical address the instruction is trying to read: guest_phys
+                            // We just read the 4-byte jump target from our safe kernel mapping of the Original Page
+                            if ((guest_phys & 0xFFF) <= (PAGE_SIZE - 4))
+                            {
+                                ULONG target_rip = *(ULONG*)((PUCHAR)hook->OriginalPageVa + (guest_phys & 0xFFF));
+
+                                // Fast-Path: We successfully emulated the memory read AND the jump!
+                                // 1. Update RIP to the new jump target
+                                __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)target_rip);
+
+                                // 2. DO NOT change EPT permissions, DO NOT enable MTF!
+                                // We completely bypassed the Ping-Pong!
+                                vcpu->advance_rip = FALSE;
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 // Swap back to original PFN with Read/Write access (Execute disabled).
                 new_entry.ReadAccess      = 1;
                 new_entry.WriteAccess     = 1;
