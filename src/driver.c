@@ -12,6 +12,15 @@
 #define IOCTL_BASE      0x800
 #define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_EPT_HOOK CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_DR_HOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _DR_HOOK_REQUEST {
+    UINT32 ProcessId;
+    PVOID  TargetAddress;
+    PVOID  RedirectAddress;  // Mode 2: If non-NULL, redirect execution here
+    UINT8  ModifyRegIdx;     // Mode 1: 0=RAX, 1=RCX... 0xFF=None
+    UINT64 ModifyRegVal;     // Mode 1: Value to set the register to
+} DR_HOOK_REQUEST, *PDR_HOOK_REQUEST;
 
 typedef struct _EPT_HOOK_REQUEST {
     UINT32 ProcessId;
@@ -383,6 +392,56 @@ Exit:
     return status;
 }
 
+// Safe IPI worker that runs on all cores in VMX Non-Root mode.
+// It does not execute privileged instructions directly; it simply
+// rings the doorbell (VMCALL) to safely enter VMX Root mode on each core.
+static ULONG_PTR
+BroadcastVmcallWorker(ULONG_PTR Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
+    return 0;
+}
+
+static NTSTATUS
+DriverHandleDrHook(_In_ PDR_HOOK_REQUEST req)
+{
+    PEPROCESS target_process = NULL;
+    NTSTATUS status;
+
+    if (!req->ProcessId || !req->TargetAddress)
+        return STATUS_INVALID_PARAMETER;
+
+    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req->ProcessId, &target_process);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    KAPC_STATE apc_state;
+    KeStackAttachProcess(target_process, &apc_state);
+    UINT64 target_cr3 = __readcr3() & ~0xFFFULL;
+    KeUnstackDetachProcess(&apc_state);
+
+    ObDereferenceObject(target_process);
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        g_vcpu[i].dr0_hook_target_rip = (UINT64)req->TargetAddress;
+        g_vcpu[i].dr0_hook_redirect_rip = (UINT64)req->RedirectAddress;
+        g_vcpu[i].dr0_hook_modify_reg_idx = req->ModifyRegIdx;
+        g_vcpu[i].dr0_hook_modify_reg_val = req->ModifyRegVal;
+        g_vcpu[i].dr0_hook_target_cr3 = target_cr3;
+        g_vcpu[i].dr0_hook_enabled = TRUE;
+    }
+
+    // Trigger VMCALL to update DR0 and DR7 inside the VMCS for all cores simultaneously
+    KeIpiGenericCall((PKIPI_BROADCAST_WORKER)BroadcastVmcallWorker, 0);
+
+    DbgPrintEx(0, 0, "[hv] DR0 Hook Enabled! Target: %llX, Redirect: %llX, ModReg: %u, Val: %llX\n",
+               (UINT64)req->TargetAddress, (UINT64)req->RedirectAddress, req->ModifyRegIdx, req->ModifyRegVal);
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 DriverIoControl(
     _In_ PDEVICE_OBJECT device_obj,
@@ -406,6 +465,20 @@ DriverIoControl(
         {
             *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
             irp->IoStatus.Information = sizeof(UINT32);
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+
+    case IOCTL_HV_DR_HOOK:
+    {
+        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(DR_HOOK_REQUEST))
+        {
+            PDR_HOOK_REQUEST req = (PDR_HOOK_REQUEST)irp->AssociatedIrp.SystemBuffer;
+            status = DriverHandleDrHook(req);
         }
         else
         {

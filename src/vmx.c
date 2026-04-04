@@ -212,6 +212,7 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     pri_proc_requested =
         CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING |
         CPU_BASED_VM_EXEC_CTRL_USE_IO_BITMAPS |
+        CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING |
         CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS;
 
     if (!g_stealth_cpuid_cache.outer_hypervisor_present)
@@ -222,6 +223,9 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
         vmx_basic.VmxControls ? IA32_VMX_TRUE_PROCBASED_CTLS : IA32_VMX_PROCBASED_CTLS);
 
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pri_proc);
+
+    // Enable interception of #DB (Hardware Debug Exception)
+    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, (1 << EXCEPTION_VECTOR_DEBUG));
 
     vcpu->mov_dr_exiting = !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING);
 

@@ -165,6 +165,14 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_HOOK_STATE mtf_hook_state;
     BOOLEAN         mtf_write_occurred;
 
+    // Hardware DR0 Hook Tracking
+    BOOLEAN dr0_hook_enabled;
+    UINT64  dr0_hook_target_cr3;
+    UINT64  dr0_hook_target_rip;
+    UINT64  dr0_hook_redirect_rip;
+    UINT8   dr0_hook_modify_reg_idx; // 0=RAX, 1=RCX... 0xFF=None
+    UINT64  dr0_hook_modify_reg_val;
+
     // guest DR0-DR3/DR6 saved on vm-exit, restored before vmresume
     UINT64  guest_dr0;
     UINT64  guest_dr1;

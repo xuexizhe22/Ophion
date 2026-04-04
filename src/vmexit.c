@@ -977,6 +977,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     {
     case VMCALL_TEST:
         ept_invept_all();
+        if (vcpu->dr0_hook_enabled)
+        {
+            // Write the hardware breakpoint into the real guest DR0
+            __writedr(0, vcpu->dr0_hook_target_rip);
+            // Enable DR0 global breakpoint (bit 1), Execution breakpoint (bits 16,17=00), 1-byte length (bits 18,19=00)
+            __vmx_vmwrite(VMCS_GUEST_DR7, 0x00000402ULL);
+        }
         regs->rax = (UINT64)STATUS_SUCCESS;
         break;
 
@@ -1085,13 +1092,24 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         UINT64 val = *reg_ptr;
         switch (dr_num)
         {
-        case 0: vcpu->guest_dr0 = val; break;
+        case 0:
+            if (!vcpu->dr0_hook_enabled) vcpu->guest_dr0 = val;
+            break;
         case 1: vcpu->guest_dr1 = val; break;
         case 2: vcpu->guest_dr2 = val; break;
         case 3: vcpu->guest_dr3 = val; break;
         case 6: vcpu->guest_dr6 = val; break;
         case 7:
-            __vmx_vmwrite(VMCS_GUEST_DR7, val);
+            if (vcpu->dr0_hook_enabled)
+            {
+                // Force our DR0 breakpoint to stay active (G0=1, LEN0/RW0=0000)
+                UINT64 actual_dr7 = (val & ~0x000F0003ULL) | 0x00000402ULL;
+                __vmx_vmwrite(VMCS_GUEST_DR7, actual_dr7);
+            }
+            else
+            {
+                __vmx_vmwrite(VMCS_GUEST_DR7, val);
+            }
             break;
         }
     }
@@ -1100,13 +1118,18 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         UINT64 val = 0;
         switch (dr_num)
         {
-        case 0: val = vcpu->guest_dr0; break;
+        case 0: val = vcpu->dr0_hook_enabled ? 0 : vcpu->guest_dr0; break;
         case 1: val = vcpu->guest_dr1; break;
         case 2: val = vcpu->guest_dr2; break;
         case 3: val = vcpu->guest_dr3; break;
         case 6: val = vcpu->guest_dr6; break;
         case 7:
             __vmx_vmread(VMCS_GUEST_DR7, &val);
+            if (vcpu->dr0_hook_enabled)
+            {
+                // Hide our breakpoint from the guest's read
+                val &= ~0x000F0003ULL;
+            }
             break;
         default: break;
         }
@@ -1516,6 +1539,69 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
         if (int_info.Valid)
         {
+            if (int_info.Vector == EXCEPTION_VECTOR_DEBUG)
+            {
+                UINT64 guest_rip = 0;
+                UINT64 guest_cr3 = 0;
+                __vmx_vmread(VMCS_GUEST_RIP, &guest_rip);
+                __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+                guest_cr3 &= ~0xFFFULL;
+
+                if (vcpu->dr0_hook_enabled &&
+                    guest_rip == vcpu->dr0_hook_target_rip &&
+                    (!vcpu->dr0_hook_target_cr3 || vcpu->dr0_hook_target_cr3 == guest_cr3))
+                {
+                    // Acknowledge DB exception by clearing DR6 B0 so the guest OS doesn't see it
+                    UINT64 guest_dr6 = 0;
+                    __vmx_vmread(VMCS_GUEST_DR6, &guest_dr6);
+                    guest_dr6 &= ~1ULL;
+                    __vmx_vmwrite(VMCS_GUEST_DR6, guest_dr6);
+
+                    // Suppress re-execution of the breakpoint by setting the Resume Flag (RF)
+                    UINT64 rflags = 0;
+                    __vmx_vmread(VMCS_GUEST_RFLAGS, &rflags);
+                    rflags |= (1ULL << 16); // RF flag
+                    __vmx_vmwrite(VMCS_GUEST_RFLAGS, rflags);
+
+                    if (vcpu->dr0_hook_redirect_rip)
+                    {
+                        // Mode 2: Execution Redirect
+                        __vmx_vmwrite(VMCS_GUEST_RIP, vcpu->dr0_hook_redirect_rip);
+                    }
+                    else
+                    {
+                        // Mode 1: Context Modification
+                        if (vcpu->dr0_hook_modify_reg_idx != 0xFF)
+                        {
+                            UINT64* reg_ptr = NULL;
+                            switch (vcpu->dr0_hook_modify_reg_idx) {
+                                case 0: reg_ptr = &vcpu->regs->rax; break;
+                                case 1: reg_ptr = &vcpu->regs->rcx; break;
+                                case 2: reg_ptr = &vcpu->regs->rdx; break;
+                                case 3: reg_ptr = &vcpu->regs->rbx; break;
+                                case 5: reg_ptr = &vcpu->regs->rbp; break;
+                                case 6: reg_ptr = &vcpu->regs->rsi; break;
+                                case 7: reg_ptr = &vcpu->regs->rdi; break;
+                                case 8: reg_ptr = &vcpu->regs->r8; break;
+                                case 9: reg_ptr = &vcpu->regs->r9; break;
+                                case 10: reg_ptr = &vcpu->regs->r10; break;
+                                case 11: reg_ptr = &vcpu->regs->r11; break;
+                                case 12: reg_ptr = &vcpu->regs->r12; break;
+                                case 13: reg_ptr = &vcpu->regs->r13; break;
+                                case 14: reg_ptr = &vcpu->regs->r14; break;
+                                case 15: reg_ptr = &vcpu->regs->r15; break;
+                            }
+                            if (reg_ptr) {
+                                *reg_ptr = vcpu->dr0_hook_modify_reg_val;
+                            }
+                        }
+                    }
+
+                    vcpu->advance_rip = FALSE;
+                    return;
+                }
+            }
+
             if (int_info.InterruptionType == INTERRUPT_TYPE_NMI)
             {
                 //

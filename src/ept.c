@@ -679,9 +679,11 @@ ept_hook_page(
     hook->LockedMdl = locked_mdl;
     InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
 
-    // 触发当前核心的 VM-Exit，在 VMCALL_TEST 处理器中调用 ept_invept_all()
-    // Intel SDM 保证基于同一个 EPT Pointer 的 INVEPT 可以全局生效，不需要用 DPC 广播死锁所有核心
-    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
+    // Broadcast an IPI to safely trigger a VM-Exit across all cores simultaneously.
+    // Because this rings the VMCALL doorbell on all cores from VMX Non-Root mode,
+    // it perfectly synchronizes the EPT TLBs and DR registers without causing DPC deadlocks or #UD crashes.
+    extern ULONG_PTR BroadcastVmcallWorker(ULONG_PTR Context);
+    KeIpiGenericCall((PKIPI_BROADCAST_WORKER)BroadcastVmcallWorker, 0);
 
     DbgPrintEx(0, 0, "[hv] EPT Hook installed at PFN 0x%llx (Fake: 0x%llx, PID=%p, CR3=0x%llx, page=%p, offset=0x%Ix, size=0x%Ix)\n",
                hook->OriginalPfn, hook->FakePfn, hook->ProcessId, hook->TargetCr3, hook->TargetPageBase, hook->PatchOffset, hook->PatchSize);
