@@ -1,4 +1,4 @@
-/*
+﻿/*
 *   hv_types.h - core hypervisor type definitions — per-vcpu state, ept structures, configs
 *   zero windows api dependency in vmx-root mode by design
 */
@@ -16,6 +16,48 @@
 #define VMCS_SIZE               0x1000
 #define MAX_PROCESSORS          256
 #define MAX_MTRR_RANGES         256
+#define EPT_HOOK_MAX_PATCH_SIZE 16
+#define EPT_HOOK_MAX_PATCHES_PER_PAGE 8
+#define EPT_HOOK_HOTSPOT_COUNT  8
+#define EPT_HOOK_HOTSPOT_SAMPLE_EVERY 16
+#define EPT_HOOK_MAX_FAST_RULES 8
+
+typedef struct _EPT_HOOK_PATCH_ENTRY {
+    SIZE_T Offset;
+    SIZE_T Size;
+    UCHAR  Bytes[EPT_HOOK_MAX_PATCH_SIZE];
+} EPT_HOOK_PATCH_ENTRY, *PEPT_HOOK_PATCH_ENTRY;
+
+typedef struct _EPT_HOOK_HOTSPOT_ENTRY {
+    UINT64 Rip;
+    UINT64 GuestPhysical;
+    UINT64 GuestLinear;
+    UINT64 HitCount;
+    UINT32 Flags;
+    UINT32 Reserved;
+} EPT_HOOK_HOTSPOT_ENTRY, *PEPT_HOOK_HOTSPOT_ENTRY;
+
+typedef enum _EPT_HOOK_FAST_RULE_TYPE {
+    EptHookFastRuleNone = 0,
+    EptHookFastRuleLookupMovzx = 1,
+    EptHookFastRuleLookupMovsx = 2,
+    EptHookFastRuleLookupMov = 3,
+    EptHookFastRuleFfJmp = 4,
+    EptHookFastRuleFfCall = 5
+} EPT_HOOK_FAST_RULE_TYPE;
+
+typedef struct _EPT_HOOK_FAST_RULE {
+    UINT16 RipOffset;
+    UINT16 GlaOffsetStart;
+    UINT16 GlaOffsetEnd;
+    UINT8  Type;
+    UINT8  DestReg;
+    UINT8  DataSize;
+    UINT8  InsnLength;
+    UINT8  Opcode[4];
+    UINT8  OpcodeLength;
+    UINT8  Reserved[3];
+} EPT_HOOK_FAST_RULE, *PEPT_HOOK_FAST_RULE;
 
 #define HV_POOL_TAG             'nhpO'
 
@@ -75,6 +117,8 @@ typedef struct _EPT_HOOK_STATE {
     SIZE_T     OriginalPfn;
     SIZE_T     FakePfn;
     BOOLEAN    Enabled;
+    volatile LONG AccessLock;
+    volatile LONG HotspotLock;
     UINT64     TargetCr3;
     PVOID      TargetPageBase;
     PVOID      OriginalPageVa;
@@ -82,8 +126,37 @@ typedef struct _EPT_HOOK_STATE {
     PEPROCESS  ProcessObject;
     PMDL       LockedMdl;
     HANDLE     ProcessId;
+    UINT32     PatchCount;
     SIZE_T     PatchOffset;
     SIZE_T     PatchSize;
+    UCHAR      PatchBytes[EPT_HOOK_MAX_PATCH_SIZE];
+    EPT_HOOK_PATCH_ENTRY Patches[EPT_HOOK_MAX_PATCHES_PER_PAGE];
+    volatile LONG64 ExecuteViolationCount;
+    volatile LONG64 ReadViolationCount;
+    volatile LONG64 WriteViolationCount;
+    volatile LONG64 ContextMismatchCount;
+    volatile LONG64 MtfCount;
+    volatile LONG64 EmulationSuccessCount;
+    volatile LONG64 EmulationFailureCount;
+    volatile LONG64 LastViolationRip;
+    volatile LONG64 LastGuestPhysical;
+    volatile LONG64 LastGuestLinear;
+    volatile LONG   LastViolationFlags;
+    volatile LONG64 HotspotSequence;
+    EPT_HOOK_HOTSPOT_ENTRY Hotspots[EPT_HOOK_HOTSPOT_COUNT];
+    UINT32     FastRuleCount;
+    EPT_HOOK_FAST_RULE FastRules[EPT_HOOK_MAX_FAST_RULES];
+
+    // FF-raw-32 emulation diagnostics
+    volatile LONG64 FfRawFailMode;         // failed: not 32-bit compat mode
+    volatile LONG64 FfRawFailInsnRead;     // failed: instruction bytes read
+    volatile LONG64 FfRawFailOpcode;       // failed: opcode/modrm/prefix check
+    volatile LONG64 FfRawFailAddrCalc;     // failed: address calc / phys mismatch
+    volatile LONG64 FfRawFailTargetRead;   // failed: reading target DWORD
+    volatile LONG64 FfRawFailStack;        // failed: CALL stack push
+    volatile LONG64 FfRawSuccess;          // general path success
+    volatile LONG64 FfShortcutSuccess;     // same-page shortcut success
+    volatile LONG64 FfShortcutFail;        // same-page shortcut failed
 } EPT_HOOK_STATE, *PEPT_HOOK_STATE;
 
 typedef struct _EPT_STATE {
@@ -110,6 +183,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64 vmxon_pa;
     UINT64 vmcs_va;
     UINT64 vmcs_pa;
+    UINT64 host_gdt_va;
 
     //
     // VMM stack (HOST_RSP points near top of this)

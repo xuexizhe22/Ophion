@@ -15,6 +15,7 @@
     <RootNamespace>Ophion</RootNamespace>
     <ProjectName>Ophion</ProjectName>
     <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <VcpkgEnabled>false</VcpkgEnabled>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <!-- Configuration: x64 Release (Kernel Mode) -->
@@ -44,7 +45,7 @@
   </ImportGroup>
   <!-- Output directories -->
   <PropertyGroup>
-    <OutDir>$(ProjectDir)build\bin\$(Configuration)\</OutDir>
+    <OutDir>.\x64\Release</OutDir>
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
     <TargetName>Ophion</TargetName>
     <TargetExt>.sys</TargetExt>
@@ -57,14 +58,15 @@
   <!-- Compiler settings: Release -->
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>_AMD64_;AMD64;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>ZYAN_NO_LIBC;ZYDIS_NO_LIBC;ZYCORE_STATIC_BUILD;ZYDIS_STATIC_BUILD;_AMD64_;AMD64;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\zycore\include;$(ProjectDir)third_party\zycore\src;$(ProjectDir)third_party\zydis\include;$(ProjectDir)third_party\zydis\src;$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>MaxSpeed</Optimization>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <WholeProgramOptimization>true</WholeProgramOptimization>
+      <DisableSpecificWarnings>4201;4603;4627;4986;4987;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <TreatWarningAsError>false</TreatWarningAsError>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -87,10 +89,11 @@
   <!-- Compiler settings: Debug -->
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>_AMD64_;AMD64;_DEBUG;DBG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>ZYAN_NO_LIBC;ZYDIS_NO_LIBC;ZYCORE_STATIC_BUILD;ZYDIS_STATIC_BUILD;_AMD64_;AMD64;_DEBUG;DBG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\zycore\include;$(ProjectDir)third_party\zycore\src;$(ProjectDir)third_party\zydis\include;$(ProjectDir)third_party\zydis\src;$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
+      <DisableSpecificWarnings>4201;4748;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <TreatWarningAsError>false</TreatWarningAsError>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -120,6 +123,28 @@
     <ClCompile Include="src\util.c" />
     <ClCompile Include="src\stealth.c" />
     <ClCompile Include="src\hostcr3.c" />
+    <ClCompile Include="third_party\zycore\src\Allocator.c" />
+    <ClCompile Include="third_party\zycore\src\ArgParse.c" />
+    <ClCompile Include="third_party\zycore\src\Bitset.c" />
+    <ClCompile Include="third_party\zycore\src\Format.c" />
+    <ClCompile Include="third_party\zycore\src\List.c" />
+    <ClCompile Include="third_party\zycore\src\String.c">
+      <ObjectFileName>$(IntDir)zycore_string.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="third_party\zycore\src\Vector.c" />
+    <ClCompile Include="third_party\zycore\src\Zycore.c" />
+    <ClCompile Include="third_party\zydis\src\Decoder.c" />
+    <ClCompile Include="third_party\zydis\src\DecoderData.c" />
+    <ClCompile Include="third_party\zydis\src\MetaInfo.c" />
+    <ClCompile Include="third_party\zydis\src\Mnemonic.c" />
+    <ClCompile Include="third_party\zydis\src\Register.c" />
+    <ClCompile Include="third_party\zydis\src\Segment.c" />
+    <ClCompile Include="third_party\zydis\src\SharedData.c" />
+    <ClCompile Include="third_party\zydis\src\String.c">
+      <ObjectFileName>$(IntDir)zydis_string.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="third_party\zydis\src\Utils.c" />
+    <ClCompile Include="third_party\zydis\src\Zydis.c" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>

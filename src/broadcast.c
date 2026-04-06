@@ -104,7 +104,14 @@ dpc_update_ept(
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
 
-    asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0); // Trigger a VM-exit to allow hypervisor to process EPT changes and invalidate TLB
+    if (g_vcpu)
+    {
+        ULONG core = KeGetCurrentProcessorNumberEx(NULL);
+        VIRTUAL_MACHINE_STATE * vcpu = (core < g_cpu_count) ? &g_vcpu[core] : NULL;
+
+        if (vcpu && vcpu->launched)
+            asm_vmx_vmcall(VMCALL_TEST, 0, 0, 0);
+    }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);

@@ -32,11 +32,7 @@ pa_to_va(UINT64 pa)
 UINT64
 get_system_cr3(VOID)
 {
-
-    // the safest portable way: just read __readcr3() from DPC context
-    // since DPC runs in system process context.
-    // for maximum safety and portability, we use the sytem eprocess cr3:
-    //
+    // DirectoryTableBase is at offset 0x28 in KPROCESS on all x64 Windows.
     PEPROCESS sys_proc = PsInitialSystemProcess;
     if (sys_proc)
     {

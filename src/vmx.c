@@ -5,6 +5,8 @@
 */
 #include "hv.h"
 
+static volatile LONG g_vmx_nested_launch_profile = 0;
+
 /*
 *   get current processor id without windows apis
 *   ia32_tsc_aux (0xc0000103) is set by the os to the processor number
@@ -166,11 +168,18 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     UINT32                  pri_proc;
     UINT32                  pri_proc_requested;
     UINT32                  sec_proc;
+    UINT32                  pin_requested;
+    UINT32                  exit_requested;
+    UINT32                  entry_requested;
     UINT64                  gdt_base;
     IA32_VMX_BASIC_REGISTER vmx_basic     = {0};
     VMX_SEGMENT_SELECTOR    seg_sel = {0};
+    BOOLEAN                 relaxed_nested_launch = FALSE;
 
     vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
+    relaxed_nested_launch =
+        g_stealth_cpuid_cache.outer_hypervisor_present &&
+        (InterlockedCompareExchange(&g_vmx_nested_launch_profile, 0, 0) > 0);
 
     //
     // mask RPL and TI bits (bits 0-2) per Intel SDM
@@ -212,10 +221,8 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     pri_proc_requested =
         CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING |
         CPU_BASED_VM_EXEC_CTRL_USE_IO_BITMAPS |
-        CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS;
-
-    if (!g_stealth_cpuid_cache.outer_hypervisor_present)
-        pri_proc_requested |= CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS;
+        CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS |
+        CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS;
 
     pri_proc = vmx_adjust_controls(
         pri_proc_requested,
@@ -246,9 +253,12 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     __vmx_vmwrite(VMCS_CTRL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, sec_proc);
 
-    UINT32 pin_ctrl = vmx_adjust_controls(
+    pin_requested =
         PIN_BASED_VM_EXEC_CTRL_NMI_EXITING |
-        PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI,
+        (relaxed_nested_launch ? 0 : PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI);
+
+    UINT32 pin_ctrl = vmx_adjust_controls(
+        pin_requested,
         vmx_basic.VmxControls ? IA32_VMX_TRUE_PINBASED_CTLS : IA32_VMX_PINBASED_CTLS);
 
     //
@@ -258,7 +268,8 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     // Force the constraint; if truly unsupported, VMLAUNCH will fail
     // with a clear error rather than the cryptic VirtNMI-without-NMI.
     //
-    if (pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI)
+    if (!relaxed_nested_launch &&
+        (pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI))
         pin_ctrl |= PIN_BASED_VM_EXEC_CTRL_NMI_EXITING;
 
     __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin_ctrl);
@@ -281,10 +292,13 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     // VMCS_VMEXIT_INTERRUPTION_INFORMATION. without this, pending interrupts
     // cause an infinite vm-exit loop -> TDR -> black blink
     //
-    UINT32 exit_ctrl = vmx_adjust_controls(
+    exit_requested =
         VM_EXIT_CTRL_HOST_ADDRESS_SPACE_SIZE |
-        VM_EXIT_CTRL_SAVE_DEBUG_CONTROLS |
-        VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT,
+        VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT |
+        (relaxed_nested_launch ? 0 : VM_EXIT_CTRL_SAVE_DEBUG_CONTROLS);
+
+    UINT32 exit_ctrl = vmx_adjust_controls(
+        exit_requested,
         vmx_basic.VmxControls ? IA32_VMX_TRUE_EXIT_CTLS : IA32_VMX_EXIT_CTLS);
 
     __vmx_vmwrite(VMCS_CTRL_PRIMARY_VMEXIT_CONTROLS, exit_ctrl);
@@ -296,10 +310,13 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     // IA-32e mode guest, load debug controls
     // required so guest sees its own DR7 after VM-exit/entry cycle
     //
+    entry_requested =
+        VM_ENTRY_CTRL_IA32E_MODE_GUEST |
+        (relaxed_nested_launch ? 0 : VM_ENTRY_CTRL_LOAD_DEBUG_CONTROLS);
+
     __vmx_vmwrite(VMCS_CTRL_VMENTRY_CONTROLS,
                   vmx_adjust_controls(
-                      VM_ENTRY_CTRL_IA32E_MODE_GUEST |
-                      VM_ENTRY_CTRL_LOAD_DEBUG_CONTROLS,
+                      entry_requested,
                       vmx_basic.VmxControls ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS));
 
     //
@@ -366,12 +383,25 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_GUEST_SYSENTER_ESP, __readmsr(IA32_SYSENTER_ESP));
 
     //
-    // host GDT and IDT — use current OS ones (simplest approach)
+    // host GDT and IDT
     //
     segment_get_descriptor((PUCHAR)asm_get_gdt_base(), asm_get_tr(), &seg_sel);
     __vmx_vmwrite(VMCS_HOST_TR_BASE,    seg_sel.Base);
-    __vmx_vmwrite(VMCS_HOST_GDTR_BASE,  asm_get_gdt_base());
     __vmx_vmwrite(VMCS_HOST_IDTR_BASE,  asm_get_idt_base());
+
+    // setup private Host GDT to avoid PatchGuard 0x109 bugcheck
+    // VM-Exit hardware sets the busy bit (Type=11) in the TR descriptor. 
+    // If we use the OS GDT, this hardware write dirties the OS GDT page and trips PG.
+    UINT16 gdt_limit = asm_get_gdt_limit();
+    if (gdt_limit > PAGE_SIZE - 1) gdt_limit = PAGE_SIZE - 1;
+    RtlCopyMemory((PVOID)vcpu->host_gdt_va, (PVOID)asm_get_gdt_base(), (SIZE_T)gdt_limit + 1);
+
+    // Patch the TR descriptor in our isolated GDT to be "Busy" 
+    // (Type 11 for 32/64-bit TSS), satisfying VM-Exit hardware requirements
+    PSEGMENT_DESCRIPTOR_32 tr_desc = (PSEGMENT_DESCRIPTOR_32)((PUCHAR)vcpu->host_gdt_va + (asm_get_tr() & ~7));
+    tr_desc->Type = 11;
+
+    __vmx_vmwrite(VMCS_HOST_GDTR_BASE, vcpu->host_gdt_va);
 
     __vmx_vmwrite(VMCS_HOST_FS_BASE, __readmsr(IA32_FS_BASE));
     __vmx_vmwrite(VMCS_HOST_GS_BASE, __readmsr(IA32_GS_BASE));
@@ -493,6 +523,9 @@ vmx_vmresume(VOID)
 BOOLEAN
 vmx_init(VOID)
 {
+    BOOLEAN launch_success = FALSE;
+    UINT32  launch_attempts = 1;
+
     g_cpu_count = KeQueryActiveProcessorCount(0);
 
     g_vcpu = (VIRTUAL_MACHINE_STATE *)ExAllocatePool2(
@@ -534,6 +567,12 @@ vmx_init(VOID)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
 
+        vcpu->host_gdt_va = (UINT64)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+        if (!vcpu->host_gdt_va)
+            return FALSE;
+        RtlZeroMemory((PVOID)vcpu->host_gdt_va, PAGE_SIZE);
+
         //
         // MSR Bitmap (1 page, all zeros = no MSR VM-exits)
         //
@@ -544,22 +583,36 @@ vmx_init(VOID)
         RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
 
         //
-        // intercept RDMSR(0x10) — IA32_TIME_STAMP_COUNTER
-        // per SDM 27.6.5, "use TSC offsetting" applies the offset to RDMSR(0x10)
-        // automatically. interception is only needed so the TSC compensation path
-        // can cover RDMSR-based timing attacks alongside RDTSC.
+        // Keep MSR bitmaps enabled even under an outer hypervisor.
+        // In nested environments, disabling the control causes a very broad
+        // RDMSR/WRMSR intercept surface, which makes shell/UI interaction feel
+        // laggy before any EPT hook is installed. A zeroed bitmap lets normal
+        // MSRs pass through while still allowing us to opt in to specific ones.
         //
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
-
-        // IA32_FEATURE_CONTROL read+write
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-
-        // VMX capability MSRs (0x480-0x493) read+write
-        for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
+        // Only install the stealth-related intercepts when stealth is active.
+        // In nested compatibility mode, preserve the outer hypervisor contract
+        // and avoid paying for MSR exits we do not actually need.
+        //
+        if (g_stealth_enabled)
         {
-            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
-            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            //
+            // intercept RDMSR(0x10) — IA32_TIME_STAMP_COUNTER
+            // per SDM 27.6.5, "use TSC offsetting" applies the offset to RDMSR(0x10)
+            // automatically. interception is only needed so the TSC compensation path
+            // can cover RDMSR-based timing attacks alongside RDTSC.
+            //
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
+
+            // IA32_FEATURE_CONTROL read+write
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
+
+            // VMX capability MSRs (0x480-0x493) read+write
+            for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
+            {
+                ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+                ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            }
         }
 
         vcpu->msr_bitmap_pa = va_to_pa(
@@ -614,16 +667,55 @@ vmx_init(VOID)
     }
 #endif
 
-    broadcast_virtualize_all();
+    if (g_stealth_cpuid_cache.outer_hypervisor_present)
+        launch_attempts = 3;
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 attempt = 0; attempt < launch_attempts; ++attempt)
     {
-        if (!g_vcpu[i].launched)
+        InterlockedExchange(&g_vmx_nested_launch_profile, (attempt == 0) ? 0 : 1);
+
+        if (attempt != 0)
         {
-            DbgPrintEx(0, 0, "[hv] Core %u failed to launch!\n", i);
-            return FALSE;
+            LARGE_INTEGER delay_interval;
+            delay_interval.QuadPart = -(10 * 1000 * 50); // 50 ms
+
+            DbgPrintEx(0, 0,
+                     "[hv] Retrying VMX launch in nested compatibility profile (attempt %u/%u)\n",
+                     attempt + 1,
+                     launch_attempts);
+            KeDelayExecutionThread(KernelMode, FALSE, &delay_interval);
+        }
+
+        broadcast_virtualize_all();
+
+        launch_success = TRUE;
+        for (UINT32 i = 0; i < g_cpu_count; i++)
+        {
+            if (!g_vcpu[i].launched)
+            {
+                DbgPrintEx(0, 0, "[hv] Core %u failed to launch on attempt %u/%u!\n",
+                         i,
+                         attempt + 1,
+                         launch_attempts);
+                launch_success = FALSE;
+            }
+        }
+
+        if (launch_success)
+            break;
+
+        broadcast_terminate_all();
+        for (UINT32 i = 0; i < g_cpu_count; ++i)
+        {
+            g_vcpu[i].vmx_active = FALSE;
+            g_vcpu[i].launched = FALSE;
         }
     }
+
+    InterlockedExchange(&g_vmx_nested_launch_profile, 0);
+
+    if (!launch_success)
+        return FALSE;
 
     DbgPrintEx(0, 0, "[hv] All %u cores virtualized successfully!\n", g_cpu_count);
     return TRUE;
@@ -651,6 +743,26 @@ vmx_terminate(VOID)
             MmFreeContiguousMemory((PVOID)vcpu->vmcs_va);
         if (vcpu->vmm_stack)
             ExFreePoolWithTag((PVOID)vcpu->vmm_stack, HV_POOL_TAG);
+
+        //
+        // safety: if the current CPU's GDTR still references this
+        // private GDT (should not happen after the VMXOFF GDTR fix,
+        // but guard against edge cases), skip freeing to avoid BSOD.
+        //
+        if (vcpu->host_gdt_va)
+        {
+            UINT64 current_gdtr_base = asm_get_gdt_base();
+            if (current_gdtr_base == vcpu->host_gdt_va)
+            {
+                DbgPrintEx(0, 0,
+                    "[hv] WARNING: GDTR still points to private GDT for core %u — leaking to avoid BSOD\n", i);
+            }
+            else
+            {
+                ExFreePoolWithTag((PVOID)vcpu->host_gdt_va, HV_POOL_TAG);
+            }
+        }
+
         if (vcpu->msr_bitmap_va)
             ExFreePoolWithTag((PVOID)vcpu->msr_bitmap_va, HV_POOL_TAG);
         if (vcpu->io_bitmap_va_a)
@@ -659,18 +771,18 @@ vmx_terminate(VOID)
             ExFreePoolWithTag((PVOID)vcpu->io_bitmap_va_b, HV_POOL_TAG);
     }
 
-    if (g_ept)
-    {
-        ept_cleanup_state();
-
-        for (UINT32 i = 0; i < g_cpu_count; i++)
+        if (g_ept)
         {
-            if (g_vcpu[i].ept_page_table)
-                MmFreeContiguousMemory(g_vcpu[i].ept_page_table);
+            ept_cleanup_state();
+
+            for (UINT32 i = 0; i < g_cpu_count; i++)
+            {
+                if (g_vcpu[i].ept_page_table)
+                    MmFreeContiguousMemory(g_vcpu[i].ept_page_table);
+            }
+            ExFreePoolWithTag(g_ept, HV_POOL_TAG);
+            g_ept = NULL;
         }
-        ExFreePoolWithTag(g_ept, HV_POOL_TAG);
-        g_ept = NULL;
-    }
 
 #if USE_PRIVATE_HOST_CR3
     hostcr3_destroy();

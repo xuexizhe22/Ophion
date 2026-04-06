@@ -74,6 +74,12 @@ BOOLEAN ept_hook_page(
     HANDLE process_id,
     PEPROCESS target_process);
 VOID    ept_disable_hook(PEPT_HOOK_STATE hook);
+BOOLEAN ept_unhook_address(HANDLE process_id, PVOID virtual_address);
+BOOLEAN ept_unhook_page(HANDLE process_id, PVOID virtual_address);
+SIZE_T  ept_unhook_all(VOID);
+BOOLEAN ept_set_fast_rules(HANDLE process_id, PVOID virtual_address, PEPT_HOOK_FAST_RULE rules, UINT32 rule_count);
+VOID    ept_begin_batch_updates(VOID);
+VOID    ept_end_batch_updates(VOID);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 VOID ept_invept_all(VOID);
