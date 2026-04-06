@@ -1,0 +1,84 @@
+--- src/vmexit.c
++++ src/vmexit.c
+@@ -952,14 +952,15 @@
+         new_entry.ReadAccess    = 1;
+         new_entry.WriteAccess   = 1;
+         new_entry.ExecuteAccess = 1;
++        new_entry.PageFrameNumber = guest_phys / PAGE_SIZE;
+
+         InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+
+-        extern ULONG_PTR BroadcastVmcallWorker(ULONG_PTR Context);
+-        KeIpiGenericCall((PKIPI_BROADCAST_WORKER)BroadcastVmcallWorker, 0);
++        ept_invept_single(vcpu->ept_pointer);
+     }
+     else
+     {
+         // If it's a 2MB large page that triggered the violation, we update the PML2 entry
+         PEPT_PML2_ENTRY pml2 = ept_get_pml2(vcpu->ept_page_table, guest_phys);
+         if (pml2 && pml2->LargePage)
+@@ -969,15 +970,15 @@
+             new_entry2.ReadAccess    = 1;
+             new_entry2.WriteAccess   = 1;
+             new_entry2.ExecuteAccess = 1;
++            new_entry2.PageFrameNumber = (guest_phys / SIZE_2_MB);
+
+             InterlockedExchange64((volatile LONG64 *)&pml2->AsUInt, new_entry2.AsUInt);
+
+-            extern ULONG_PTR BroadcastVmcallWorker(ULONG_PTR Context);
+-            KeIpiGenericCall((PKIPI_BROADCAST_WORKER)BroadcastVmcallWorker, 0);
++            ept_invept_single(vcpu->ept_pointer);
+         }
+         else
+         {
+             vmexit_inject_gp();
+         }
+     }
+@@ -1049,15 +1050,16 @@
+                 InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+
+-                // Setup an EPT Hook tracking structure so the violation handler knows how to swap
+-                PEPT_HOOK_STATE hook = (PEPT_HOOK_STATE)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(EPT_HOOK_STATE), HV_POOL_TAG);
++                // We expect the caller to have pre-allocated and locked the EPT_HOOK_STATE structure
++                // and passed its physical address in R8, since we cannot call ExAllocatePool in VMX Root.
++                // But since this is a PoC for driver cloaking, we can actually just insert it into the list
++                // IF the caller passed it in R8. For now, let's assume R8 contains the physical address of the pre-allocated hook struct.
++                PHYSICAL_ADDRESS hook_pa; hook_pa.QuadPart = regs->r8;
++                PEPT_HOOK_STATE hook = (PEPT_HOOK_STATE)MmGetVirtualForPhysical(hook_pa); // Only safe for non-paged RAM, which this is.
++
+                 if (hook)
+                 {
+                     RtlZeroMemory(hook, sizeof(EPT_HOOK_STATE));
+                     hook->OriginalPfn = g_ept->dummy_page_pfn;
+                     hook->FakePfn     = real_pfn;
+                     hook->OriginalPageVa = g_ept->dummy_page_va;
+                     hook->FakeVa      = (PVOID)target_va;
+                     hook->TargetCr3   = g_system_cr3;
+                     hook->Enabled     = TRUE;
+
+-                    KIRQL old_irql;
+-                    KeAcquireSpinLock(&g_ept->hook_lock, &old_irql);
+-                    InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
+-                    KeReleaseSpinLock(&g_ept->hook_lock, old_irql);
++                    // We must insert it lock-free or use a VMX-safe spinlock.
++                    // For this simple driver hide PoC, if we assume single-threaded initialization, it's fine.
++                    // However, to be perfectly safe, we should build a lock-free list or use a proper VMX spinlock.
++                    // For now, we will simply insert it since we are in VMX root (all other cores are either running guest code or also in VMX root).
++                    // Wait, another core could be in VMX root accessing this list.
++                    // A simple Interlocked operation is needed, but for the PoC, we will bypass the list insertion
++                    // and just let the EPT handle the read-zeroes. Wait, if it's not in the list, execute-violation won't swap it back!
++                    // We must insert it. We'll use a crude lock-free push or just rely on the fact that driver hiding happens at boot.
++                    // Actually, the best way is to not use a VMCALL at all, but an IOCTL that prepares the struct in Ring 0,
++                    // acquires the lock, inserts it, and THEN issues a VMCALL_TEST to flush TLB.
++                    // But the user requested VMCALL. Let's just use the spinlock but WITHOUT KeAcquireSpinLock (which lowers IRQL).
++                    // In VMX Root, we don't have an IRQL. We just use a raw interlocked bit test and set.
++                    while (InterlockedBitTestAndSet64((LONG64*)&g_ept->hook_lock, 0)) { _mm_pause(); }
++                    InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
++                    InterlockedAnd64((LONG64*)&g_ept->hook_lock, 0); // Release
+
+                     DbgPrintEx(0, 0, "[hv] VMCALL Cloaked Page: VA=0x%llX, RealPFN=0x%llX\n", target_va, real_pfn);
+                 }
+
+                 ept_invept_all();
+                 regs->rax = (UINT64)STATUS_SUCCESS;
+             }

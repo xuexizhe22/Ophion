@@ -94,6 +94,10 @@ typedef struct _EPT_STATE {
     LIST_ENTRY            hooked_pages;    // active EPT hooks
     LIST_ENTRY            dynamic_splits;  // split PML1 tables allocated on demand
 
+    // Driver Cloaking (Dummy Page for Anti-Dump)
+    PVOID                 dummy_page_va;
+    SIZE_T                dummy_page_pfn;
+
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
     //
@@ -185,6 +189,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 
 #define VMCALL_TEST             0x00000001
 #define VMCALL_VMXOFF           0x00000002
+#define VMCALL_HIDE_DRIVER_PAGE 0x00001337
 
 extern VIRTUAL_MACHINE_STATE * g_vcpu;
 extern EPT_STATE *             g_ept;

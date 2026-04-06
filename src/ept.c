@@ -398,6 +398,13 @@ ept_init(VOID)
 
     RtlZeroMemory(g_ept, sizeof(EPT_STATE));
 
+    // Allocate a permanent "Dummy Page" filled with Zeros to cloak hidden drivers against memory dumps
+    g_ept->dummy_page_va = MmAllocateContiguousMemory(PAGE_SIZE, (PHYSICAL_ADDRESS){.QuadPart = MAXULONG64});
+    if (!g_ept->dummy_page_va)
+        return FALSE;
+    RtlZeroMemory(g_ept->dummy_page_va, PAGE_SIZE);
+    g_ept->dummy_page_pfn = va_to_pa(g_ept->dummy_page_va) / PAGE_SIZE;
+
     InitializeListHead(&g_ept->hooked_pages);
     InitializeListHead(&g_ept->dynamic_splits);
 

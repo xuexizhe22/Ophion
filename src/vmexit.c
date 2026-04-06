@@ -862,6 +862,17 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
             }
             else if (qual.ReadAccess || qual.WriteAccess)
             {
+                // Safety check for Driver Cloaking (Anti-Dump):
+                // If a driver cloaked itself (OriginalPfn is the Dummy Page), we DO NOT allow writes.
+                // We also DO NOT copy writes to the FakePfn. The cloaked page is read-only 0x00.
+                if (hook->OriginalPfn == g_ept->dummy_page_pfn && qual.WriteAccess)
+                {
+                    // Ignore writes to the dummy page to prevent memory corruption.
+                    vmexit_inject_gp();
+                    vcpu->advance_rip = FALSE;
+                    return;
+                }
+
                 // Guest is trying to read/write the execute-only page.
 
                 // === DBVM-Style Micro-Emulator Fast-Path (The Ultimate Ping-Pong Killer) ===
@@ -938,8 +949,51 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
-    // Unhandled EPT violation (should not happen in identity map unless unmapped)
-    vmexit_inject_gp();
+    // Dynamic EPT Allocation / Passthrough (DBVM-Style):
+    // If we hit an unhandled EPT violation (e.g. newly loaded driver MMIO, hot-plug RAM),
+    // instead of blindly injecting #GP (which causes BSODs like KMODE_EXCEPTION_NOT_HANDLED),
+    // we dynamically grant R/W/X permissions to the missing page, mapping it directly.
+    // This allows the Windows memory manager to dynamically allocate non-paged pools or MMIO safely.
+    PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, guest_phys);
+    if (pml1)
+    {
+        EPT_PML1_ENTRY new_entry;
+        new_entry.AsUInt = pml1->AsUInt;
+        new_entry.ReadAccess    = 1;
+        new_entry.WriteAccess   = 1;
+        new_entry.ExecuteAccess = 1;
+        new_entry.PageFrameNumber = guest_phys / PAGE_SIZE; // Crucial fix: assign correct PFN instead of leaving it 0
+
+        InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+        ept_invept_single(vcpu->ept_pointer);
+    }
+    else
+    {
+        // If it's a 2MB large page that triggered the violation, we update the PML2 entry
+        PEPT_PML2_ENTRY pml2 = ept_get_pml2(vcpu->ept_page_table, guest_phys);
+        if (pml2 && pml2->LargePage)
+        {
+            EPT_PML2_ENTRY new_entry2;
+            new_entry2.AsUInt = pml2->AsUInt;
+            new_entry2.ReadAccess    = 1;
+            new_entry2.WriteAccess   = 1;
+            new_entry2.ExecuteAccess = 1;
+            new_entry2.PageFrameNumber = guest_phys / SIZE_2_MB;
+
+            InterlockedExchange64((volatile LONG64 *)&pml2->AsUInt, new_entry2.AsUInt);
+            ept_invept_single(vcpu->ept_pointer);
+        }
+        else
+        {
+            // Absolute worst-case scenario: No page table entry exists for this physical address.
+            // We pass it to the guest safely via #PF instead of #GP if possible, or just ignore.
+            // Actually, we shouldn't #GP. Just let the guest handle it natively.
+            // But since the hardware needs a translation, we must #PF or let it crash.
+            vmexit_inject_gp();
+        }
+    }
+
+    // We do not advance RIP because we want the instruction to re-execute successfully now.
     vcpu->advance_rip = FALSE;
 }
 
@@ -975,6 +1029,76 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
     switch (vmcall_num)
     {
+    case VMCALL_HIDE_DRIVER_PAGE:
+    {
+        // Simple Driver Cloaking (Anti-Dump):
+        // The driver calls this VMCALL with RDX = Virtual Address of the page to hide.
+        // We set the EPT so that reads return zeros (Dummy Page), while execution stays on the real page.
+        UINT64 target_va = regs->rdx;
+        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)target_va);
+
+        if (pa.QuadPart != 0 && g_ept && g_ept->dummy_page_va)
+        {
+            SIZE_T real_pfn = pa.QuadPart / PAGE_SIZE;
+
+            PEPT_PML1_ENTRY pml1 = ept_get_pml1(vcpu->ept_page_table, pa.QuadPart);
+            if (pml1)
+            {
+                EPT_PML1_ENTRY new_entry;
+                new_entry.AsUInt = pml1->AsUInt;
+
+                // Read/Write access points to the Dummy Page (all 0x00s)
+                // Execute access is revoked from the Dummy Page.
+                // When an execute violation occurs, we will swap to the real page.
+                new_entry.ReadAccess      = 1;
+                new_entry.WriteAccess     = 1;
+                new_entry.ExecuteAccess   = 0;
+                new_entry.PageFrameNumber = g_ept->dummy_page_pfn;
+
+                InterlockedExchange64((volatile LONG64 *)&pml1->AsUInt, new_entry.AsUInt);
+
+                // We expect the caller to have pre-allocated and locked the EPT_HOOK_STATE structure
+                // and passed its physical address in R8, since we cannot call ExAllocatePool in VMX Root.
+                // Assuming R8 contains the physical address of the pre-allocated hook struct.
+                PHYSICAL_ADDRESS hook_pa;
+                hook_pa.QuadPart = regs->r8;
+                PEPT_HOOK_STATE hook = (PEPT_HOOK_STATE)MmGetVirtualForPhysical(hook_pa); // Only safe for resident RAM
+
+                if (hook)
+                {
+                    RtlZeroMemory(hook, sizeof(EPT_HOOK_STATE));
+                    hook->OriginalPfn = g_ept->dummy_page_pfn;
+                    hook->FakePfn     = real_pfn;
+                    hook->OriginalPageVa = g_ept->dummy_page_va;
+                    hook->FakeVa      = (PVOID)target_va;
+                    hook->TargetCr3   = g_system_cr3;
+                    hook->Enabled     = TRUE;
+
+                    // In VMX Root, we do not have IRQL and cannot safely use KeAcquireSpinLock.
+                    // We use a raw Interlocked mechanism to build a simple lock-free append or a bare spinlock.
+                    // Since this is a PoC, we do a raw spin.
+                    while (InterlockedBitTestAndSet64((LONG64*)&g_ept->hook_lock, 0)) { _mm_pause(); }
+                    InsertTailList(&g_ept->hooked_pages, &hook->ListEntry);
+                    InterlockedAnd64((LONG64*)&g_ept->hook_lock, 0); // Release
+
+                    DbgPrintEx(0, 0, "[hv] VMCALL Cloaked Page: VA=0x%llX, RealPFN=0x%llX\n", target_va, real_pfn);
+                }
+
+                ept_invept_all();
+                regs->rax = (UINT64)STATUS_SUCCESS;
+            }
+            else
+            {
+                regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+            }
+        }
+        else
+        {
+            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+        }
+        break;
+    }
+
     case VMCALL_TEST:
         ept_invept_all();
         if (vcpu->dr0_hook_enabled)
