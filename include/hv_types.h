@@ -169,6 +169,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_HOOK_STATE mtf_hook_state;
     BOOLEAN         mtf_write_occurred;
 
+    // TF Backoff for debugger compatibility
+    BOOLEAN         guest_tf_active;
+
     // Hardware DR0 Hook Tracking
     BOOLEAN dr0_hook_enabled;
     UINT64  dr0_hook_target_cr3;

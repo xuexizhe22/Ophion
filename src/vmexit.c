@@ -853,6 +853,26 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
                 new_entry.ExecuteAccess   = 1;
                 new_entry.PageFrameNumber = hook->OriginalPfn;
 
+                // ====================================================================
+                // TF Backoff Logic for Debugger Compatibility
+                // ====================================================================
+                size_t guest_rflags = 0;
+                __vmx_vmread(VMCS_GUEST_RFLAGS, &guest_rflags);
+
+                // Check if the Guest Trap Flag (TF) is set (Bit 8)
+                if (guest_rflags & 0x100)
+                {
+                    vcpu->guest_tf_active = TRUE;
+                    // Clear the TF flag temporarily to avoid conflict with MTF
+                    guest_rflags &= ~0x100ULL;
+                    __vmx_vmwrite(VMCS_GUEST_RFLAGS, guest_rflags);
+                }
+                else
+                {
+                    vcpu->guest_tf_active = FALSE;
+                }
+                // ====================================================================
+
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &cpu_controls);
                 cpu_controls |= (size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, cpu_controls);
@@ -1534,6 +1554,35 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             }
             vcpu->mtf_hook_state = NULL;
         }
+
+        // ====================================================================
+        // Restore Guest TF and inject #DB if necessary
+        // ====================================================================
+        if (vcpu->guest_tf_active)
+        {
+            size_t guest_rflags = 0;
+            __vmx_vmread(VMCS_GUEST_RFLAGS, &guest_rflags);
+
+            // Restore TF
+            guest_rflags |= 0x100ULL;
+            __vmx_vmwrite(VMCS_GUEST_RFLAGS, guest_rflags);
+
+            // Inject a #DB exception to the Guest (Vector 1, Type: Hardware Exception)
+            // Valid bit (31), Type Hardware Exception (011b), Vector 1
+            UINT32 interrupt_info = 0x80000301;
+            __vmx_vmwrite(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, interrupt_info);
+            __vmx_vmwrite(VMCS_CTRL_VMENTRY_EXCEPTION_ERROR_CODE, 0);
+
+            // Need to set pending debug exceptions (BS - Single Step) to make the guest debugger happy
+            // VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS bit 14 is BS (Single Step)
+            size_t pending_dbg = 0;
+            __vmx_vmread(VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS, &pending_dbg);
+            pending_dbg |= (1ULL << 14);
+            __vmx_vmwrite(VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS, pending_dbg);
+
+            vcpu->guest_tf_active = FALSE;
+        }
+        // ====================================================================
 
         vcpu->advance_rip = FALSE;
         break;
